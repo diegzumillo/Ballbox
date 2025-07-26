@@ -15,14 +15,14 @@ Balls in a box!
 
 **Features:**
 - ✅ Dynamic spheres and cubes with realistic physics
-- ✅ Static spheres and cubes  
+- ✅ Static spheres and cubes. Which is also realistic, I suppose
 - ✅ Impulse-based collision resolution
 - ✅ Mass, velocity, and angular velocity control
-- ✅ Force application system
+- ✅ Force and torque application
 - ✅ Single header file
 - ✅ Data Oriented Design (to the best of my abilities, at least)
 - ⏳ Static SDFs (Signed Distance Functions. I need it for my other thing)
-- ⏳ Constraints, like hinges, springs (maybe)
+- ⏳ Constraints, like hinges, springs. So we can use boxes and spheres to build more complex objects.
 
 ## Quick Start
 
@@ -31,7 +31,7 @@ Balls in a box!
 3. Add objects with `AddBox()` and `AddSphere()`
 4. Update the simulation with `PhysicsStep()`
 
-I asked a generic AI to look at my test scene that uses raylib, "hey, make a shorter program that's easier to follow that illustrates ballbox". And it spat this out. It looks solid to me!
+As for the arguments, I asked a generic AI to look at my test scene that uses raylib, "hey, make a shorter program that's easier to follow that illustrates ballbox". And it spat this out. It looks solid to me!
 
 ```c
 #include <stdio.h>
