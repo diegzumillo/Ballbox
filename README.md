@@ -1,9 +1,11 @@
 # Ballbox
 
+
+![demogif](./physicswip2.gif)
+
 > **⚠️ WARNING**  
 > I released this thing just now. It worked in my test scene on my computer. Still needs testing.
 
-![demogif](https://i.imgur.com/2Ecc7Oo.gif)
 
 A lightweight, single-header 3D physics engine written in C. Because apparently that's a thing that didn't exist and I kinda need one for my other project. You should probably try one of the fancy ones first, with the C bindings and whatnot. When that proves to be too much of a headache, and you feel like all you need is balls and boxes, or balls in a box, then you come back here.
 
@@ -18,6 +20,7 @@ Balls in a box!
 - ✅ Mass, velocity, and angular velocity control
 - ✅ Force application system
 - ✅ Single header file
+- ✅ Data Oriented Design (to the best of my abilities, at least)
 - ⏳ Static SDFs (Signed Distance Functions. I need it for my other thing)
 - ⏳ Constraints, like hinges, springs (maybe)
 
@@ -68,7 +71,7 @@ I asked a generic AI to look at my test scene that uses raylib, "hey, make a sho
 
 ```
 
-You could also add torque with AddSphereTorque(world, sphere, torque) to make it spin, but I have neglected rotation in the spheres part so I'm not sure how useful that will be. But do use AddBoxForce() and AddBoxTorque() for boxes.
+You could also add torque with AddSphereTorque(world, sphere, torque) to make it spin, but I have neglected rotation in the spheres side so I'm not sure how useful that will be. But do use AddBoxForce() and AddBoxTorque() for boxes.
 
 # Notes
 
