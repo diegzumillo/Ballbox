@@ -49,14 +49,14 @@ I asked a generic AI to look at my test scene that uses raylib, "hey, make a sho
       int ground = AddBox(world, (Vec3){0, -1, 0}, (Vec3){10, 1, 10}, QuatIdentity());
       SetBoxStatic(world, ground, true);
 
-      // Simulate for 100 steps
-      for (int i = 0; i < 100; i++) {
+      // Simulate for 1000 steps. (Or in a while loop, like any sane game developer. This AI is mad.)
+      for (int i = 0; i < 1000; i++) {
           // Apply a sideways force for the first 30 steps
           if (i < 30) {
               AddSphereForce(world, sphere, (Vec3){2.0f, 0, 0});  // Push right
           }
 
-          PhysicsStep(world, 1.0f/60.0f);  // 60 FPS timestep
+          PhysicsStep(world, 1.0f/60.0f);  // You should probably soem kind of deltatime your engine provides
 
           // Print sphere position every 10 steps
           if (i % 10 == 0) {
