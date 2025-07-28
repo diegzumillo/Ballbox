@@ -88,17 +88,25 @@ typedef struct {
     int capacity;
 } CollisionCollection;
 
+// Function pointer type for user-defined SDF
+typedef float (*SDFFunction)(Vec3 point);
+
 typedef struct {
     SphereSystem* spheres;
     BoxSystem* boxes;
     CollisionCollection* collisions;
     Vec3 gravity;
     float dt;
+    bool usesSDF;
+    SDFFunction SDFCollider;
 } PhysicsWorld;
 
 // Create/destroy physics world
 PhysicsWorld* CreatePhysicsWorld(int max_spheres, int max_boxes, int max_collisions);
 void DestroyPhysicsWorld(PhysicsWorld* world);
+
+// SDF system
+void UseSDF(PhysicsWorld* world, SDFFunction sdf_function);
 
 // Main simulation step - call once per frame
 void PhysicsStep(PhysicsWorld* world, float deltaTime);
@@ -156,6 +164,10 @@ bool CheckSphereBoxCollision(Vec3 spherePos, float sphereRadius, Vec3 boxPos, Ve
 bool CheckSphereBoxCollisionWithData(Vec3 spherePos, float sphereRadius, Vec3 boxPos, Vec3 boxSize, Quat boxRot, CollisionContact* contact);
 bool CheckBoxCollision(Vec3 pos1, Vec3 size1, Quat rot1, Vec3 pos2, Vec3 size2, Quat rot2);
 bool CheckBoxCollisionWithData(Vec3 pos1, Vec3 size1, Quat rot1, Vec3 pos2, Vec3 size2, Quat rot2, CollisionContact* contact);
+
+// SDF functions for static colliders
+Vec3 SDF_EstimateNormal(PhysicsWorld* world, Vec3 point);
+bool CheckBoxSDFCollision(PhysicsWorld* world, Vec3 boxPos, Vec3 boxSize, Quat boxRot, CollisionContact* contact);
 
 // Implementation
 
@@ -1047,6 +1059,8 @@ PhysicsWorld* CreatePhysicsWorld(int max_spheres, int max_boxes, int max_collisi
     // Set default values
     world->gravity = (Vec3){ 0.0f, 0.0f, 0.0f }; // No gravity for now
     world->dt = 1.0f / 60.0f;
+    world->usesSDF = false;
+    world->SDFCollider = NULL;
     
     // Check for allocation failures
     if (!world->spheres || !world->boxes || !world->collisions || !world->collisions->contacts) {
@@ -1069,6 +1083,14 @@ void DestroyPhysicsWorld(PhysicsWorld* world) {
     }
     
     free(world);
+}
+
+// Register user SDF function and enable SDF collision detection
+void UseSDF(PhysicsWorld* world, SDFFunction sdf_function) {
+    if (!world) return;
+    
+    world->SDFCollider = sdf_function;
+    world->usesSDF = (sdf_function != NULL);
 }
 
 // Main physics simulation step
@@ -1200,8 +1222,8 @@ void IntegrateMotion(PhysicsWorld* world) {
     }
     
     // Apply damping to reduce sliding and spinning
-    const float linear_damping = 0.98f;  // Reduces sliding
-    const float angular_damping = 0.9f; // Reduces spinning
+    const float linear_damping = 0.99f;  // Reduces sliding
+    const float angular_damping = 0.99f; // Reduces spinning
     
     // Apply damping to spheres
     for (int i = 0; i < world->spheres->count; i++) {
@@ -1284,6 +1306,51 @@ void CollectCollisions(PhysicsWorld* world) {
             }
         }
     }
+    
+    // Sphere-SDF collisions (A=sphere, B=SDF)
+    if (world->usesSDF && world->SDFCollider) {
+        for (int i = 0; i < world->spheres->count; i++) {
+            if (world->collisions->count >= world->collisions->capacity) break;
+            
+            Vec3 sphere_center = world->spheres->positions[i];
+            float sphere_radius = world->spheres->radii[i];
+            
+            // Evaluate SDF at sphere center using user function
+            float d = world->SDFCollider(sphere_center);
+            
+            // Check if sphere intersects SDF (d < radius means collision)
+            if (d < sphere_radius) {
+                CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
+                
+                // Calculate collision data
+                contact->penetration =  sphere_radius-d;
+                // SDF gradient points outward from surface, but we need normal from sphere to surface (A to B)
+                Vec3 sdf_gradient = SDF_EstimateNormal(world, sphere_center);
+                contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f); // Negate to point from sphere to surface
+                contact->contact_point = Vec3Sub(sphere_center, Vec3Scale(contact->contact_normal, sphere_radius));
+                
+                contact->bodyA_type = 0; contact->bodyA_index = i;  // A = sphere
+                contact->bodyB_type = 2; contact->bodyB_index = 0; // B = SDF (type 2, index 0)
+                world->collisions->count++;
+            }
+        }
+    }
+    
+    // Box-SDF collisions (A=box, B=SDF)
+    if (world->usesSDF && world->SDFCollider) {
+        for (int i = 0; i < world->boxes->count; i++) {
+            if (world->collisions->count >= world->collisions->capacity) break;
+            
+            CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
+            if (CheckBoxSDFCollision(world, world->boxes->positions[i], world->boxes->sizes[i], 
+                                    world->boxes->rotations[i], contact)) {
+                
+                contact->bodyA_type = 1; contact->bodyA_index = i;  // A = box
+                contact->bodyB_type = 2; contact->bodyB_index = 0; // B = SDF (type 2, index 0)
+                world->collisions->count++;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1302,10 +1369,14 @@ Vec3 GetBodyVelocityAtPoint(PhysicsWorld* world, int bodyType, int bodyIndex, Ve
         bodyPos = world->spheres->positions[bodyIndex];
         bodyVel = world->spheres->velocities[bodyIndex];
         bodyAngVel = world->spheres->angular_velocities[bodyIndex];
-    } else { // Box
+    } else if (bodyType == 1) { // Box
         bodyPos = world->boxes->positions[bodyIndex];
         bodyVel = world->boxes->velocities[bodyIndex];
         bodyAngVel = world->boxes->angular_velocities[bodyIndex];
+    } else { // SDF (type 2) - static, no velocity
+        bodyPos = (Vec3){ 0.0f, 0.0f, 0.0f }; // Not used for static objects
+        bodyVel = (Vec3){ 0.0f, 0.0f, 0.0f };
+        bodyAngVel = (Vec3){ 0.0f, 0.0f, 0.0f };
     }
     
     // Calculate r = contact_point - body_center
@@ -1321,16 +1392,20 @@ float CalculateEffectiveMass(PhysicsWorld* world, CollisionContact* contact) {
     Vec3 n = contact->contact_normal;
     Vec3 r1 = Vec3Sub(contact->contact_point, 
                      (contact->bodyA_type == 0) ? world->spheres->positions[contact->bodyA_index] 
-                                               : world->boxes->positions[contact->bodyA_index]);
+                   : (contact->bodyA_type == 1) ? world->boxes->positions[contact->bodyA_index]
+                                               : (Vec3){ 0.0f, 0.0f, 0.0f }); // SDF position not used
     Vec3 r2 = Vec3Sub(contact->contact_point, 
                      (contact->bodyB_type == 0) ? world->spheres->positions[contact->bodyB_index] 
-                                               : world->boxes->positions[contact->bodyB_index]);
+                   : (contact->bodyB_type == 1) ? world->boxes->positions[contact->bodyB_index]
+                                               : (Vec3){ 0.0f, 0.0f, 0.0f }); // SDF position not used
     
     // Check for static objects and handle infinite mass
     bool is_static1 = (contact->bodyA_type == 0) ? world->spheres->is_static[contact->bodyA_index] 
-                                                 : world->boxes->is_static[contact->bodyA_index];
+                    : (contact->bodyA_type == 1) ? world->boxes->is_static[contact->bodyA_index]
+                                                 : true; // SDF is always static
     bool is_static2 = (contact->bodyB_type == 0) ? world->spheres->is_static[contact->bodyB_index] 
-                                                 : world->boxes->is_static[contact->bodyB_index];
+                    : (contact->bodyB_type == 1) ? world->boxes->is_static[contact->bodyB_index]
+                                                 : true; // SDF is always static
     
     // Get masses (use very large mass for static objects)
     //float m1 = is_static1 ? 1e10f : ((contact->bodyA_type == 0) ? world->spheres->masses[contact->bodyA_index] 
@@ -1338,14 +1413,14 @@ float CalculateEffectiveMass(PhysicsWorld* world, CollisionContact* contact) {
     //float m2 = is_static2 ? 1e10f : ((contact->bodyB_type == 0) ? world->spheres->masses[contact->bodyB_index] 
     //
     float inv_m1 = is_static1 ? 0.0f : 
-    1.0f / ((contact->bodyA_type == 0) ? 
-            world->spheres->masses[contact->bodyA_index] : 
-            world->boxes->masses[contact->bodyA_index]);
+        1.0f / ((contact->bodyA_type == 0) ? world->spheres->masses[contact->bodyA_index] 
+              : (contact->bodyA_type == 1) ? world->boxes->masses[contact->bodyA_index]
+                                           : 1.0f); // SDF fallback (not used since static)
 
     float inv_m2 = is_static2 ? 0.0f : 
-        1.0f / ((contact->bodyB_type == 0) ? 
-                world->spheres->masses[contact->bodyB_index] : 
-                world->boxes->masses[contact->bodyB_index]);
+        1.0f / ((contact->bodyB_type == 0) ? world->spheres->masses[contact->bodyB_index] 
+              : (contact->bodyB_type == 1) ? world->boxes->masses[contact->bodyB_index]
+                                           : 1.0f); // SDF fallback (not used since static)
                                                          
     
     // Calculate inertia terms (skip for static objects)
@@ -1414,7 +1489,7 @@ void ApplyImpulse(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 impulse
         Vec3 deltaAngVel = Vec3Scale(torque, inv_inertia);
         world->spheres->angular_velocities[bodyIndex] = Vec3Add(world->spheres->angular_velocities[bodyIndex], deltaAngVel);
         
-    } else { // Box
+    } else if (bodyType == 1) { // Box
         // Skip static objects
         if (world->boxes->is_static[bodyIndex]) return;
         
@@ -1443,6 +1518,8 @@ void ApplyImpulse(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 impulse
         // Transform angular velocity change back to world space
         Vec3 deltaAngVel = QuatRotateVec3(boxRotation, deltaAngVelLocal);
         world->boxes->angular_velocities[bodyIndex] = Vec3Add(world->boxes->angular_velocities[bodyIndex], deltaAngVel);
+    } else { // SDF (type 2) - static, no impulse applied
+        return;
     }
 }
 
@@ -1455,16 +1532,20 @@ void PositionalCorrection(PhysicsWorld* world, CollisionContact* contact) {
     
     // Get inverse masses
     bool is_static1 = (contact->bodyA_type == 0) ? world->spheres->is_static[contact->bodyA_index] 
-                                                 : world->boxes->is_static[contact->bodyA_index];
+                    : (contact->bodyA_type == 1) ? world->boxes->is_static[contact->bodyA_index]
+                                                 : true; // SDF is always static
     bool is_static2 = (contact->bodyB_type == 0) ? world->spheres->is_static[contact->bodyB_index] 
-                                                 : world->boxes->is_static[contact->bodyB_index];
+                    : (contact->bodyB_type == 1) ? world->boxes->is_static[contact->bodyB_index]
+                                                 : true; // SDF is always static
     
     float inv_massA = is_static1 ? 0.0f : 
         1.0f / ((contact->bodyA_type == 0) ? world->spheres->masses[contact->bodyA_index] 
-                                           : world->boxes->masses[contact->bodyA_index]);
+              : (contact->bodyA_type == 1) ? world->boxes->masses[contact->bodyA_index]
+                                           : 1.0f); // SDF fallback (not used since static)
     float inv_massB = is_static2 ? 0.0f : 
         1.0f / ((contact->bodyB_type == 0) ? world->spheres->masses[contact->bodyB_index] 
-                                           : world->boxes->masses[contact->bodyB_index]);
+              : (contact->bodyB_type == 1) ? world->boxes->masses[contact->bodyB_index]
+                                           : 1.0f); // SDF fallback (not used since static)
     
     float total_inv_mass = inv_massA + inv_massB;
     if (total_inv_mass < 1e-10f) return;
@@ -1481,15 +1562,16 @@ void PositionalCorrection(PhysicsWorld* world, CollisionContact* contact) {
     if (contact->bodyA_type == 0 && !is_static1) {
         world->spheres->positions[contact->bodyA_index] = 
             Vec3Add(world->spheres->positions[contact->bodyA_index], correctionA);
-    } else if (!is_static1) {
+    } else if (contact->bodyA_type == 1 && !is_static1) {
         world->boxes->positions[contact->bodyA_index] = 
             Vec3Add(world->boxes->positions[contact->bodyA_index], correctionA);
     }
+    // No correction applied for SDF (type 2) since it's always static
     
     if (contact->bodyB_type == 0 && !is_static2) {
         world->spheres->positions[contact->bodyB_index] = 
             Vec3Add(world->spheres->positions[contact->bodyB_index], correctionB);
-    } else if (!is_static2) {
+    } else if (contact->bodyB_type == 1 && !is_static2) {
         world->boxes->positions[contact->bodyB_index] = 
             Vec3Add(world->boxes->positions[contact->bodyB_index], correctionB);
     }
@@ -1577,6 +1659,109 @@ void CleanupPhysics(PhysicsWorld* world) {
     }
     
     // Forces are already cleared in IntegrateMotion()
+}
+
+
+// Estimate normal at a point using finite differences
+Vec3 SDF_EstimateNormal(PhysicsWorld* world, Vec3 point) {
+    const float epsilon = 0.001f;
+    Vec3 eps_x = { epsilon, 0.0f, 0.0f };
+    Vec3 eps_y = { 0.0f, epsilon, 0.0f };
+    Vec3 eps_z = { 0.0f, 0.0f, epsilon };
+    
+    float nx = world->SDFCollider(Vec3Add(point, eps_x)) - world->SDFCollider(Vec3Sub(point, eps_x));
+    float ny = world->SDFCollider(Vec3Add(point, eps_y)) - world->SDFCollider(Vec3Sub(point, eps_y));
+    float nz = world->SDFCollider(Vec3Add(point, eps_z)) - world->SDFCollider(Vec3Sub(point, eps_z));
+    
+    Vec3 normal = { nx, ny, nz };
+    return Vec3Normalize(normal);
+}
+
+// Box-SDF collision detection using 3-stage approach
+bool CheckBoxSDFCollision(PhysicsWorld* world, Vec3 boxPos, Vec3 boxSize, Quat boxRot, CollisionContact* contact) {
+    // Stage 1: Circumscribed sphere test
+    // Calculate radius of circumscribed sphere (distance from center to farthest corner)
+    float circumscribed_radius = Vec3Length(boxSize);
+    
+    // Evaluate SDF at box center
+    float center_distance = world->SDFCollider(boxPos);
+    
+    // If SDF distance > circumscribed radius, no collision possible
+    if (center_distance > circumscribed_radius) {
+        return false;
+    }
+    
+    // Stage 2: Vertex test - check all 8 vertices of the box
+    Vec3 vertices[8];
+    OBB box_obb = CreateOBB(boxPos, boxSize, boxRot);
+    GetOBBVertices(&box_obb, vertices);
+    
+    float deepest_penetration = -999999.0f;
+    Vec3 deepest_point = { 0.0f, 0.0f, 0.0f };
+    bool vertex_collision = false;
+    
+    for (int i = 0; i < 8; i++) {
+        float vertex_distance = world->SDFCollider(vertices[i]);
+        
+        // If vertex is inside SDF (distance < 0), we have collision
+        if (vertex_distance < 0.0f) {
+            vertex_collision = true;
+            float penetration = -vertex_distance;
+            
+            if (penetration > deepest_penetration) {
+                deepest_penetration = penetration;
+                deepest_point = vertices[i];
+            }
+        }
+    }
+    
+    if (vertex_collision && contact) {
+        contact->penetration = deepest_penetration;
+        Vec3 sdf_gradient = SDF_EstimateNormal(world, deepest_point);
+        contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f); // Negate to point from box to surface
+        contact->contact_point = deepest_point;
+        return true;
+    }
+    
+    // Stage 3: Face center test - check center of each face
+    Vec3 face_centers[6];
+    
+    // Calculate face centers: box center + (half_extent * face_normal)
+    Vec3 x_axis = QuatRotateVec3(boxRot, (Vec3){1.0f, 0.0f, 0.0f});
+    Vec3 y_axis = QuatRotateVec3(boxRot, (Vec3){0.0f, 1.0f, 0.0f});
+    Vec3 z_axis = QuatRotateVec3(boxRot, (Vec3){0.0f, 0.0f, 1.0f});
+    
+    face_centers[0] = Vec3Add(boxPos, Vec3Scale(x_axis, boxSize.x));   // +X face
+    face_centers[1] = Vec3Sub(boxPos, Vec3Scale(x_axis, boxSize.x));   // -X face
+    face_centers[2] = Vec3Add(boxPos, Vec3Scale(y_axis, boxSize.y));   // +Y face
+    face_centers[3] = Vec3Sub(boxPos, Vec3Scale(y_axis, boxSize.y));   // -Y face
+    face_centers[4] = Vec3Add(boxPos, Vec3Scale(z_axis, boxSize.z));   // +Z face
+    face_centers[5] = Vec3Sub(boxPos, Vec3Scale(z_axis, boxSize.z));   // -Z face
+    
+    for (int i = 0; i < 6; i++) {
+        float face_distance = world->SDFCollider(face_centers[i]);
+        
+        // If face center is inside SDF (distance < 0), we have collision
+        if (face_distance < 0.0f) {
+            float penetration = -face_distance;
+            
+            if (penetration > deepest_penetration) {
+                deepest_penetration = penetration;
+                deepest_point = face_centers[i];
+                vertex_collision = true; // Mark as collision found
+            }
+        }
+    }
+    
+    if (vertex_collision && contact) {
+        contact->penetration = deepest_penetration;
+        Vec3 sdf_gradient = SDF_EstimateNormal(world, deepest_point);
+        contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f); // Negate to point from box to surface
+        contact->contact_point = deepest_point;
+        return true;
+    }
+    
+    return false;
 }
 
 #endif // BALLBOX_H
