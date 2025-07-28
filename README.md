@@ -103,3 +103,6 @@ MIT License.
 ## Contributing
 
 Found a bug? Have a feature request? Open an issue or submit a PR. 
+
+Want to help me pay some bills? check out [my Patreon blog](https://www.patreon.com/Diegomakesgames), where I talk about game dev and other stuff.
+
