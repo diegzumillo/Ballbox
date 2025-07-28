@@ -7,7 +7,7 @@
 > I released this thing just now. It worked in my test scene on my computer. Still needs testing.
 
 
-A lightweight, single-header 3D physics engine written in C. Because apparently that's a thing that didn't exist and I kinda need one for my other project. You should probably try one of the fancy ones first, with the C bindings and whatnot. When that proves to be too much of a headache, and you feel like all you need is balls and boxes, or balls in a box, then you come back here.
+A lightweight, single-header 3D physics engine written in C. Because apparently that's a thing that didn't exist and I kinda need one for my other project. It does spheres, boxes, and static SDF (signed distance functions). You should probably try one of the fancy engines/libraries first, with the C bindings and whatnot. When that proves to be too much of a headache, and you feel like all you need is balls and boxes, or balls in a box, then you come back here.
 
 Balls in a box!
 
@@ -21,7 +21,7 @@ Balls in a box!
 - ✅ Force and torque application
 - ✅ Single header file
 - ✅ Data Oriented Design (to the best of my abilities, at least)
-- ⏳ Static SDFs (Signed Distance Functions. I need it for my other thing)
+- ✅ Static SDFs (Signed Distance Functions. I need it for my other thing)
 - ⏳ Constraints, like hinges, springs. So we can use boxes and spheres to build more complex objects.
 
 ## Quick Start
@@ -73,9 +73,27 @@ As for the arguments, I asked a generic AI to look at my test scene that uses ra
 
 You could also add torque with AddSphereTorque(world, sphere, torque) to make it spin, but I have neglected rotation in the spheres side so I'm not sure how useful that will be. But do use AddBoxForce() and AddBoxTorque() for boxes.
 
+# Static SDF collider
+
+Signed distance functions can be defined to serve as colliders for your dynamic objects. Although a niche feature, for sure, it's here if you need it. It's very simple to use. You define your SDF, then, after you create the world with CreatePhysicsWorld, you call UseSDF() with the world and your function. And that's it.
+
+```c
+// Create your own function. You can make an entire scene here, fractals, primitive objects, etc. 
+float WavyGroundSDF(Vec3 point) {
+    float wavy_y = sinf(point.x) * sinf(point.z);
+    return point.y - wavy_y;
+}
+
+// Then...
+PhysicsWorld* world = CreatePhysicsWorld(50, 50, 500);
+UseSDF(world, WavyGroundSDF);
+```
+
 # Notes
 
 There are lots of improvements to be made here. Many parameters are still hard coded deep in the code, like restitution, drag, etc. Eventually these will be exposed in a more user-friendly way, and others will be assigned on an object-basis. 
+
+The SDF-box collision detection is an approximation. The test is done on the vertices and the centers of the faces. It will look unnatural when the SDF's scale of detail matches the boxes colliding with it. 
 
 
 ## License
