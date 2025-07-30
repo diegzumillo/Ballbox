@@ -27,14 +27,17 @@ Balls in a box!
 ## Quick Start
 
 1. Include the header: `#include "ballbox.h"`
-2. Create a physics world with `CreatePhysicsWorld()`
-3. Add objects with `AddBox()` and `AddSphere()`
-4. Update the simulation with `PhysicsStep()`
+2. You also need to add `#define BALLBOX_IMPLEMENTATION` in your source file, or before the include
+3. Create a physics world with `CreatePhysicsWorld()`
+4. Add objects with `AddBox()` and `AddSphere()`
+5. Update the simulation with `PhysicsStep()`
 
 As for the arguments, I asked a generic AI to look at my test scene that uses raylib, "hey, make a shorter program that's easier to follow that illustrates ballbox". And it spat this out. It looks solid to me!
 
 ```c
-#include <stdio.h>
+
+  #include <stdio.h>
+  #define BALLBOX_IMPLEMENTATION
   #include "ballbox.h"
 
   int main() {
@@ -73,7 +76,7 @@ As for the arguments, I asked a generic AI to look at my test scene that uses ra
 
 You could also add torque with AddSphereTorque(world, sphere, torque) to make it spin, but I have neglected rotation in the spheres side so I'm not sure how useful that will be. But do use AddBoxForce() and AddBoxTorque() for boxes.
 
-# Static SDF collider
+## Static SDF collider
 
 Signed distance functions can be defined to serve as colliders for your dynamic objects. Although a niche feature, for sure, it's here if you need it. It's very simple to use. You define your SDF, then, after you create the world with CreatePhysicsWorld, you call UseSDF() with the world and your function. And that's it.
 
@@ -88,19 +91,54 @@ float WavyGroundSDF(Vec3 point) {
 PhysicsWorld* world = CreatePhysicsWorld(50, 50, 500);
 UseSDF(world, WavyGroundSDF);
 ```
-
-# Notes
-
-There are lots of improvements to be made here. Many parameters are still hard coded deep in the code, like restitution, drag, etc. Eventually these will be exposed in a more user-friendly way, and others will be assigned on an object-basis. 
-
-The SDF-box collision detection is an approximation. The test is done on the vertices and the centers of the faces. It will look unnatural when the SDF's scale of detail matches the boxes colliding with it. 
+The SDF-box collision detection is an approximation. The test is done on the vertices and the centers of the faces. It can look unnatural when the SDF's scale of detail matches the boxes colliding with it. 
 
 
-## License
+## Settings
+
+You can modify the parameters of the simulation using the settings struct:
+```c
+typedef struct {
+     // Damping (most commonly adjusted)
+     float linear_damping;      // 0.99f - reduces sliding
+     float angular_damping;     // 0.99f - reduces spinning
+     
+     // Collision response
+     float restitution;         // 0.0f - bounciness (0=no bounce, 1=full bounce)
+     float friction;            // 0.3f - surface friction coefficient
+     int solver_iterations;     // 8 - constraint solver iterations
+     
+     // Constraint solver settings (Baumgarte stabilization)
+     float baumgarte_bias;      // 0.2f - position correction bias factor
+     float allowed_penetration; // 0.01f - allowed penetration before correction
+     float velocity_threshold;   // 1.0f - relative velocity threshold for restitution
+     
+     // Sleep system: I implemented while trying to fix jittering and then neglected it. I suggest ignoring it for now.
+     float sleep_linear_threshold;   // 0.01f - linear velocity threshold for sleep
+     float sleep_angular_threshold;  // 0.01f - angular velocity threshold for sleep
+     float sleep_time_required;      // 0.5f - time at low energy before sleeping
+     
+     // Contact manifold settings (for box-box collisions)
+     float manifold_contact_tolerance;   // 0.01f - tolerance for vertex-inside-box detection
+     float manifold_penetration_tolerance; // -0.01f - minimum penetration to accept (negative = allow touching)
+     int manifold_max_contacts;          // 4 - maximum contact points per manifold
+     
+     // Numerical tolerances (rarely changed)
+     float collision_epsilon;   // 1e-6f - collision detection threshold
+     float sdf_normal_epsilon;  // 0.001f - SDF normal estimation step size
+     float vector_normalize_epsilon; // 1e-6f - vector normalization threshold
+     float quaternion_epsilon;  // 1e-6f - quaternion operations threshold
+ } PhysicsSettings;
+```
+
+So you can just call `world->settings.linear_damping = 0.9f`. I did make some functions to alter some of these parameters, but it's honestly easier to just modify the struct directly. 
+
+
+# License
 
 MIT License.
 
-## Contributing
+# Contributing
 
 Found a bug? Have a feature request? Open an issue or submit a PR. 
 
