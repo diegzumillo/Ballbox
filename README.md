@@ -1,7 +1,6 @@
 # Ballbox
 
-
-![demogif](./physicswip2.gif)
+(Scroll to the bottom for some demo gifs)
 
 > **⚠️ WARNING**  
 > I released this thing just now. It worked in my test scene on my computer. Still needs testing.
@@ -132,6 +131,13 @@ typedef struct {
 ```
 
 So you can just call `world->settings.linear_damping = 0.9f`. I did make some functions to alter some of these parameters, but it's honestly easier to just modify the struct directly. 
+
+# Demo GIFs
+
+
+![demogif](./physicswip2.gif)
+![demogif](./physicswip3.gif)
+
 
 
 # License
