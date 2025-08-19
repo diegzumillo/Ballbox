@@ -17,6 +17,7 @@ Balls in a box!
 - ✅ Static spheres and cubes. Which is also realistic, I suppose
 - ✅ Impulse-based collision resolution
 - ✅ Mass, velocity, and angular velocity control
+- ✅ Collision callbacks
 - ✅ Force and torque application
 - ✅ Single header file
 - ✅ Data Oriented Design (to the best of my abilities, at least)
@@ -50,6 +51,17 @@ As for the arguments, I asked a generic AI to look at my test scene that uses ra
       // Add a static box as ground
       int ground = AddBox(world, (Vec3){0, -1, 0}, (Vec3){10, 1, 10}, QuatIdentity());
       SetBoxStatic(world, ground, true);
+
+
+      // Collision callback test function
+      void OnSphereHitsBox(int selfIndex, int otherBodyType, int otherIndex, CollisionContact* contact) {
+          if (otherBodyType == 1) { // 1 = box
+              printf("Sphere %d hit Box %d! Penetration: %.3f\n", selfIndex, otherIndex, contact->penetration);
+          }
+      }
+    
+      // Register collision callback for the controlled sphere
+      SetSphereCollisionCallback(world, sphere, OnSphereHitsBox);
 
       // Simulate for 1000 steps. (Or in a while loop, like any sane game developer. This AI is mad.)
       for (int i = 0; i < 1000; i++) {
