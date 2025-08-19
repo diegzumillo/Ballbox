@@ -150,7 +150,8 @@ So you can just call `world->settings.linear_damping = 0.9f`. I did make some fu
 
 ![demogif](./physicswip2.gif)
 ![demogif](./physicswip3.gif)
-
+![demogif](./physicswip_constraints_velcontrol.gif)
+The previous gif is testing how the simulation handles direct velocity control and if I can constraint objects to remain together with just forces.
 
 
 # License
