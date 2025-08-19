@@ -60,7 +60,7 @@ As for the arguments, I asked a generic AI to look at my test scene that uses ra
           }
       }
     
-      // Register collision callback for the controlled sphere
+      // Register collision callback for the sphere
       SetSphereCollisionCallback(world, sphere, OnSphereHitsBox);
 
       // Simulate for 1000 steps. (Or in a while loop, like any sane game developer. This AI is mad.)
@@ -70,7 +70,8 @@ As for the arguments, I asked a generic AI to look at my test scene that uses ra
               AddSphereForce(world, sphere, (Vec3){2.0f, 0, 0});  // Push right
           }
 
-          PhysicsStep(world, 1.0f/60.0f);  // You should probably soem kind of deltatime your engine provides
+          // You should probably use some kind of deltatime your engine provides here
+          PhysicsStep(world, 1.0f/60.0f);  
 
           // Print sphere position every 10 steps
           if (i % 10 == 0) {
