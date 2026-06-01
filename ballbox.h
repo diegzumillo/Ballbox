@@ -47,10 +47,12 @@ typedef struct {
 } Box;
 
 typedef struct {
-    int bodyA_type;     // 0 = sphere, 1 = box
-    int bodyA_index;
-    int bodyB_type;     // 0 = sphere, 1 = box
-    int bodyB_index;
+    int bodyA_type;     // 0 = sphere collider, 1 = box collider, 2 = SDF
+    int bodyA_index;    // Rigid body index, or -1 for SDF
+    int colliderA_index; // Collider index within its collider system, or -1 for SDF
+    int bodyB_type;     // 0 = sphere collider, 1 = box collider, 2 = SDF
+    int bodyB_index;    // Rigid body index, or -1 for SDF
+    int colliderB_index; // Collider index within its collider system, or -1 for SDF
     Vec3 contact_point;
     Vec3 contact_normal; // From A to B
     float penetration;
@@ -58,6 +60,22 @@ typedef struct {
 
 // Function pointer type for collision callbacks
 typedef void (*OnCollision)(int selfIndex, int otherBodyType, int otherIndex, CollisionContact* contact);
+
+typedef struct {
+    Vec3* positions;
+    Quat* rotations;
+    Vec3* velocities;
+    Vec3* forces;
+    float* masses;
+    Vec3* angular_velocities;
+    Vec3* torques;
+    Vec3* inertias;        // diagonal inertia tensor in local body space
+    bool* is_static;
+    bool* is_sleeping;
+    float* sleep_timers;
+    int count;
+    int capacity;
+} RigidBodySystem;
 
 typedef struct {
     Vec3* positions;
@@ -72,6 +90,8 @@ typedef struct {
     bool* is_sleeping;
     float* sleep_timers;
     OnCollision* collision_callbacks;
+    int* body_indices;
+    Vec3* local_positions;
     int count;
     int capacity;
 } SphereSystem;
@@ -90,6 +110,9 @@ typedef struct {
     bool* is_sleeping;
     float* sleep_timers;
     OnCollision* collision_callbacks;
+    int* body_indices;
+    Vec3* local_positions;
+    Quat* local_rotations;
     int count;
     int capacity;
 } BoxSystem;
@@ -109,18 +132,22 @@ typedef struct {
     int point_count;       // Number of valid points (0 to manifold_max_contacts)
     
     // Body identification
-    int bodyA_type;        // 0 = sphere, 1 = box, 2 = SDF
-    int bodyA_index;
-    int bodyB_type;        // 0 = sphere, 1 = box, 2 = SDF
-    int bodyB_index;
+    int bodyA_type;        // 0 = sphere collider, 1 = box collider, 2 = SDF
+    int bodyA_index;       // Rigid body index, or -1 for SDF
+    int colliderA_index;   // Collider index within its collider system, or -1 for SDF
+    int bodyB_type;        // 0 = sphere collider, 1 = box collider, 2 = SDF
+    int bodyB_index;       // Rigid body index, or -1 for SDF
+    int colliderB_index;   // Collider index within its collider system, or -1 for SDF
 } ContactManifold;
 
 // Contact constraint for Sequential Impulse solver
 typedef struct {
-    int bodyA_type;     // 0 = sphere, 1 = box, 2 = SDF
-    int bodyA_index;
-    int bodyB_type;     // 0 = sphere, 1 = box, 2 = SDF  
-    int bodyB_index;
+    int bodyA_type;     // 0 = sphere collider, 1 = box collider, 2 = SDF
+    int bodyA_index;    // Rigid body index, or -1 for SDF
+    int colliderA_index; // Collider index within its collider system, or -1 for SDF
+    int bodyB_type;     // 0 = sphere collider, 1 = box collider, 2 = SDF
+    int bodyB_index;    // Rigid body index, or -1 for SDF
+    int colliderB_index; // Collider index within its collider system, or -1 for SDF
     
     Vec3 contact_point;
     Vec3 contact_normal;    // From A to B
@@ -149,8 +176,84 @@ typedef struct {
     int capacity;
 } ConstraintCollection;
 
-// Function pointer type for user-defined SDF
+typedef enum {
+    PHYSICS_JOINT_FIXED = 0,
+    PHYSICS_JOINT_HINGE = 1,
+    PHYSICS_JOINT_SPRING = 2
+} PhysicsJointType;
+
+typedef struct {
+    PhysicsJointType type;
+    int bodyA_index;
+    int bodyB_index;
+
+    Vec3 local_anchor_a;
+    Vec3 local_anchor_b;
+
+    // Hinge axis in each body's local space. Fixed joints use this only for
+    // optional debug/introspection.
+    Vec3 local_axis_a;
+    Vec3 local_axis_b;
+
+    // For fixed joints, preserves B's starting orientation relative to A.
+    Quat reference_rotation;
+
+    bool enable_motor;
+    float motor_speed;
+    float max_motor_impulse;
+
+    // Spring joints use Hooke force plus damping along the anchor-to-anchor
+    // line. rest_length is in world units, stiffness is force/unit, damping is
+    // force per relative velocity along the spring axis.
+    float rest_length;
+    float stiffness;
+    float damping;
+} PhysicsJoint;
+
+typedef struct {
+    PhysicsJoint* joints;
+    int count;
+    int capacity;
+} JointSystem;
+
+// Function pointer type for user-defined SDF.
+//
+// Ballbox treats negative values as "inside" and positive values as "outside"
+// when PHYSICS_SDF_BOX_SIGNED_DISTANCE is used. PHYSICS_SDF_BOX_SURFACE_TRACE
+// can also work with unsigned/implicit fields that only approach zero at the
+// surface, which is useful for raymarched content that is not a mathematically
+// strict signed-distance field.
 typedef float (*SDFFunction)(Vec3 point);
+
+// Optional analytic normal callback for SDF collisions.
+//
+// If provided through UseSDFNormal(), Ballbox uses this instead of finite
+// differencing the SDF. This is usually faster and more stable for complex or
+// approximate fields because finite differencing costs six SDF evaluations per
+// normal and can become noisy near thin/implicit surfaces.
+typedef Vec3 (*SDFNormalFunction)(Vec3 point);
+
+typedef enum {
+    // Fast path for true signed-distance fields. Box-SDF contacts are generated
+    // by sampling boundary points and accepting samples with negative distance.
+    PHYSICS_SDF_BOX_SIGNED_DISTANCE = 0,
+
+    // Robust path for implicit, unsigned, or approximate fields. Box-SDF
+    // contacts are generated by tracing from the box center to boundary samples
+    // and looking for zero-surface hits or near-surface samples.
+    PHYSICS_SDF_BOX_SURFACE_TRACE = 1
+} PhysicsSDFBoxCollisionMode;
+
+typedef enum {
+    // 8 rays from the box center to its corners. Lowest SDF query count.
+    PHYSICS_SDF_BOX_TRACE_CORNERS = 0,
+
+    // 14 rays: corners plus face centers. Better for broad face contacts.
+    PHYSICS_SDF_BOX_TRACE_CORNERS_AND_FACES = 1,
+
+    // 26 rays: corners, face centers, and edge centers. Most stable, most expensive.
+    PHYSICS_SDF_BOX_TRACE_FULL = 2
+} PhysicsSDFBoxTraceSamples;
 
 typedef struct {
     // Damping (most commonly adjusted)
@@ -176,6 +279,19 @@ typedef struct {
     float manifold_contact_tolerance;   // 0.01f - tolerance for vertex-inside-box detection
     float manifold_penetration_tolerance; // -0.01f - minimum penetration to accept (negative = allow touching)
     int manifold_max_contacts;          // 4 - maximum contact points per manifold
+
+    // Box-SDF collision settings.
+    //
+    // Default mode is PHYSICS_SDF_BOX_SURFACE_TRACE with corner rays only. That
+    // costs more than signed-distance sampling, but it catches surfaces passing
+    // through a box even when the field never returns negative values. For true
+    // signed SDFs, switch to PHYSICS_SDF_BOX_SIGNED_DISTANCE for better speed.
+    PhysicsSDFBoxCollisionMode sdf_box_collision_mode;
+    PhysicsSDFBoxTraceSamples sdf_box_trace_samples; // Corners fastest; full adds face/edge centers
+    int sdf_box_trace_steps;           // Samples per center-to-boundary ray
+    int sdf_box_trace_refine_steps;    // Bisection steps after a sign crossing
+    float sdf_box_surface_epsilon;     // Contact shell for implicit/non-distance surfaces
+    int sdf_box_max_contacts;          // Maximum SDF contacts emitted per box
     
     // Numerical tolerances (rarely changed)
     float collision_epsilon;   // 1e-6f - collision detection threshold
@@ -185,14 +301,17 @@ typedef struct {
 } PhysicsSettings;
 
 typedef struct {
+    RigidBodySystem* bodies;
     SphereSystem* spheres;
     BoxSystem* boxes;
     CollisionCollection* collisions;
     ConstraintCollection* constraints;  // Sequential Impulse constraints
+    JointSystem* joints;
     Vec3 gravity;
     float dt;
     bool usesSDF;
     SDFFunction SDFCollider;
+    SDFNormalFunction SDFNormal;
     PhysicsSettings settings;
 } PhysicsWorld;
 
@@ -200,8 +319,46 @@ typedef struct {
 PhysicsWorld* CreatePhysicsWorld(int max_spheres, int max_boxes, int max_collisions);
 void DestroyPhysicsWorld(PhysicsWorld* world);
 
-// SDF system
+// Rigid body system management.
+//
+// Ballbox now separates rigid bodies from colliders. A rigid body owns motion
+// state: position, rotation, velocity, mass, inertia, forces, and sleep/static
+// flags. Colliders own shape data and are attached to a body by index.
+//
+// Simple convenience path:
+//   int ball = AddSphere(world, pos, radius);        // body + one sphere collider
+//   SetBodyMass(world, ball, 2.0f);
+//   SetBodyInertiaAuto(world, ball);
+//
+// Compound body path:
+//   int ship = AddRigidBody(world, pos, QuatIdentity());
+//   AddBoxCollider(world, ship, local_pos_a, local_rot_a, half_extents_a);
+//   AddSphereCollider(world, ship, local_pos_b, radius_b);
+//   SetBodyMass(world, ship, 50.0f);
+//   SetBodyInertiaAuto(world, ship);
+//
+// Collision detection runs against every collider, but collision response
+// applies impulses to the owning rigid body. Colliders attached to the same
+// body are ignored during collision collection.
+RigidBodySystem* CreateRigidBodySystem(int capacity);
+void DestroyRigidBodySystem(RigidBodySystem* system);
+int AddRigidBody(PhysicsWorld* world, Vec3 position, Quat rotation);
+void SetBodyMass(PhysicsWorld* world, int bodyIndex, float mass);
+void SetBodyInertia(PhysicsWorld* world, int bodyIndex, Vec3 inertia);
+void SetBodyInertiaAuto(PhysicsWorld* world, int bodyIndex);
+void SetBodyStatic(PhysicsWorld* world, int bodyIndex, bool is_static);
+void AddBodyForce(PhysicsWorld* world, int bodyIndex, Vec3 force);
+void AddBodyTorque(PhysicsWorld* world, int bodyIndex, Vec3 torque);
+void SetBodyVelocity(PhysicsWorld* world, int bodyIndex, Vec3 velocity);
+void SetBodyAngularVelocity(PhysicsWorld* world, int bodyIndex, Vec3 angular_velocity);
+void SyncCollidersFromBodies(PhysicsWorld* world);
+
+// SDF system.
+//
+// UseSDF() registers a static scene collider. UseSDFNormal() is optional but
+// recommended when the scene can provide a cheap analytic/estimated normal.
 void UseSDF(PhysicsWorld* world, SDFFunction sdf_function);
+void UseSDFNormal(PhysicsWorld* world, SDFNormalFunction sdf_normal_function);
 
 // Physics settings convenience functions
 void SetDamping(PhysicsWorld* world, float linear, float angular);
@@ -209,6 +366,23 @@ void SetRestitution(PhysicsWorld* world, float restitution);
 void SetCorrectionParameters(PhysicsWorld* world, float baumgarte_bias, float allowed_penetration);
 void SetSolverIterations(PhysicsWorld* world, int iterations);
 void SetManifoldSettings(PhysicsWorld* world, float contact_tolerance, float penetration_tolerance, int max_contacts);
+
+// Select how boxes collide against the registered SDF.
+//
+// PHYSICS_SDF_BOX_SIGNED_DISTANCE is faster and expects negative interior
+// values. PHYSICS_SDF_BOX_SURFACE_TRACE is more expensive but supports
+// unsigned/implicit fields by marching from the box center toward boundary
+// samples.
+void SetSDFBoxCollisionMode(PhysicsWorld* world, PhysicsSDFBoxCollisionMode mode);
+
+// Tune the surface-trace mode.
+//
+// Approximate SDF query count per box is:
+//   ray_count * (trace_steps + possible refine_steps) + contact_count normals
+// where ray_count is 8, 14, or 26 depending on the sample mode. Supplying an
+// SDF normal callback avoids six extra SDF evaluations per emitted contact.
+void SetSDFSurfaceTraceSettings(PhysicsWorld* world, PhysicsSDFBoxTraceSamples samples, int trace_steps, 
+                                int refine_steps, float surface_epsilon, int max_contacts);
 void ResetPhysicsSettingsToDefaults(PhysicsWorld* world);
 
 // Main simulation step - call once per frame
@@ -233,6 +407,24 @@ ConstraintCollection* CreateConstraintCollection(int capacity);
 void DestroyConstraintCollection(ConstraintCollection* constraints);
 void ClearConstraints(ConstraintCollection* constraints);
 
+// Joint system management.
+//
+// Joints connect rigid body indices, not collider indices. They are solved in
+// the same iterative phase as contact constraints. Fixed joints constrain both
+// anchors and relative orientation. Hinge joints constrain the anchors and keep
+// the hinge axes aligned, leaving rotation around the hinge axis free.
+// Spring joints are soft force joints applied before velocity integration.
+JointSystem* CreateJointSystem(int capacity);
+void DestroyJointSystem(JointSystem* system);
+int AddFixedJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor);
+int AddHingeJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor, Vec3 worldAxis);
+int AddSpringJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchorA, Vec3 worldAnchorB,
+                   float rest_length, float stiffness, float damping);
+void SetHingeMotor(PhysicsWorld* world, int jointIndex, bool enabled, float motor_speed, float max_motor_impulse);
+void ApplySpringJointForces(PhysicsWorld* world);
+void SolveJointVelocityConstraints(PhysicsWorld* world);
+void SolveJointPositionConstraints(PhysicsWorld* world);
+
 Vec3 GetBodyVelocityAtPoint(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 point);
 float CalculateEffectiveMass(PhysicsWorld* world, CollisionContact* contact);
 void ApplyImpulse(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 impulse, Vec3 contactPoint);
@@ -255,11 +447,20 @@ Quat QuatFromEuler(float pitch, float yaw, float roll);
 void QuatToAxisAngle(Quat q, Vec3* axis, float* angle);
 Vec3 QuatRotateVec3(Quat q, Vec3 v);
 
-// Sphere system management
+// Sphere collider system management.
+//
+// AddSphere() is a convenience wrapper that creates a rigid body and one sphere
+// collider, returning the body index. AddSphereCollider() attaches a sphere
+// collider to an existing body and returns the sphere collider index.
+//
+// The SetSphere*/AddSphere* compatibility functions take sphere collider
+// indices. Prefer SetBody*/AddBody* when using the body index returned by
+// AddSphere() or AddRigidBody().
 SphereSystem* CreateSphereSystem(int capacity);
 void DestroySphereSystem(SphereSystem* system);
-int AddSphere(PhysicsWorld* world, Vec3 position, float radius);
-void SetSphereMass(PhysicsWorld* world, int index, float mass);
+int AddSphere(PhysicsWorld* world, Vec3 position, float radius); // convenience: creates body + collider, returns body index
+int AddSphereCollider(PhysicsWorld* world, int bodyIndex, Vec3 localPosition, float radius);
+void SetSphereMass(PhysicsWorld* world, int index, float mass); // compatibility: index is a sphere collider index
 void SetSphereStatic(PhysicsWorld* world, int index, bool is_static);
 void AddSphereForce(PhysicsWorld* world, int index, Vec3 force);
 void AddSphereTorque(PhysicsWorld* world, int index, Vec3 torque);
@@ -267,11 +468,20 @@ bool CheckSphereCollision(Vec3 pos1, float radius1, Vec3 pos2, float radius2);
 bool CheckSphereCollisionWithData(Vec3 pos1, float radius1, Vec3 pos2, float radius2, CollisionContact* contact);
 bool CheckSphereSystemCollisions(SphereSystem* system, int sphere_index);
 
-// Box system management  
+// Box collider system management.
+//
+// AddBox() is a convenience wrapper that creates a rigid body and one box
+// collider, returning the body index. AddBoxCollider() attaches a box collider
+// to an existing body and returns the box collider index.
+//
+// The SetBox*/AddBox* compatibility functions take box collider indices. Prefer
+// SetBody*/AddBody* when using the body index returned by AddBox() or
+// AddRigidBody().
 BoxSystem* CreateBoxSystem(int capacity);
 void DestroyBoxSystem(BoxSystem* system);
-int AddBox(PhysicsWorld* world, Vec3 position, Vec3 size, Quat rotation); // size = half-extents
-void SetBoxMass(PhysicsWorld* world, int index, float mass);
+int AddBox(PhysicsWorld* world, Vec3 position, Vec3 size, Quat rotation); // convenience: creates body + collider, returns body index
+int AddBoxCollider(PhysicsWorld* world, int bodyIndex, Vec3 localPosition, Quat localRotation, Vec3 size);
+void SetBoxMass(PhysicsWorld* world, int index, float mass); // compatibility: index is a box collider index
 void SetBoxStatic(PhysicsWorld* world, int index, bool is_static);
 void AddBoxForce(PhysicsWorld* world, int index, Vec3 force);
 void AddBoxTorque(PhysicsWorld* world, int index, Vec3 torque);
@@ -298,6 +508,65 @@ void GenerateBoxSDFContacts(PhysicsWorld* world, int boxIndex);
 
 #ifdef BALLBOX_IMPLEMENTATION
 
+RigidBodySystem* CreateRigidBodySystem(int capacity) {
+    RigidBodySystem* system = (RigidBodySystem*)malloc(sizeof(RigidBodySystem));
+    if (!system) return NULL;
+    
+    system->positions = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->rotations = (Quat*)malloc(sizeof(Quat) * capacity);
+    system->velocities = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->forces = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->masses = (float*)malloc(sizeof(float) * capacity);
+    system->angular_velocities = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->torques = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->inertias = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->is_static = (bool*)malloc(sizeof(bool) * capacity);
+    system->is_sleeping = (bool*)malloc(sizeof(bool) * capacity);
+    system->sleep_timers = (float*)malloc(sizeof(float) * capacity);
+    system->count = 0;
+    system->capacity = capacity;
+    
+    if (!system->positions || !system->rotations || !system->velocities || !system->forces ||
+        !system->masses || !system->angular_velocities || !system->torques || !system->inertias ||
+        !system->is_static || !system->is_sleeping || !system->sleep_timers) {
+        DestroyRigidBodySystem(system);
+        return NULL;
+    }
+    
+    for (int i = 0; i < capacity; i++) {
+        system->positions[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->rotations[i] = QuatIdentity();
+        system->velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->forces[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->masses[i] = 1.0f;
+        system->angular_velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->torques[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->inertias[i] = (Vec3){ 1.0f, 1.0f, 1.0f };
+        system->is_static[i] = false;
+        system->is_sleeping[i] = false;
+        system->sleep_timers[i] = 0.0f;
+    }
+    
+    return system;
+}
+
+void DestroyRigidBodySystem(RigidBodySystem* system) {
+    if (!system) return;
+    
+    if (system->positions) free(system->positions);
+    if (system->rotations) free(system->rotations);
+    if (system->velocities) free(system->velocities);
+    if (system->forces) free(system->forces);
+    if (system->masses) free(system->masses);
+    if (system->angular_velocities) free(system->angular_velocities);
+    if (system->torques) free(system->torques);
+    if (system->inertias) free(system->inertias);
+    if (system->is_static) free(system->is_static);
+    if (system->is_sleeping) free(system->is_sleeping);
+    if (system->sleep_timers) free(system->sleep_timers);
+    free(system);
+}
+
 SphereSystem* CreateSphereSystem(int capacity) {
     SphereSystem* system = (SphereSystem*)malloc(sizeof(SphereSystem));
     if (!system) return NULL;
@@ -314,12 +583,15 @@ SphereSystem* CreateSphereSystem(int capacity) {
     system->is_sleeping = (bool*)malloc(sizeof(bool) * capacity);
     system->sleep_timers = (float*)malloc(sizeof(float) * capacity);
     system->collision_callbacks = (OnCollision*)malloc(sizeof(OnCollision) * capacity);
+    system->body_indices = (int*)malloc(sizeof(int) * capacity);
+    system->local_positions = (Vec3*)malloc(sizeof(Vec3) * capacity);
     system->count = 0;
     system->capacity = capacity;
     
     if (!system->positions || !system->radii || !system->velocities || !system->forces || 
         !system->masses || !system->angular_velocities || !system->torques || !system->inertias || 
-        !system->is_static || !system->is_sleeping || !system->sleep_timers || !system->collision_callbacks) {
+        !system->is_static || !system->is_sleeping || !system->sleep_timers || !system->collision_callbacks ||
+        !system->body_indices || !system->local_positions) {
         DestroySphereSystem(system);
         return NULL;
     }
@@ -337,6 +609,8 @@ SphereSystem* CreateSphereSystem(int capacity) {
         system->is_sleeping[i] = false;
         system->sleep_timers[i] = 0.0f;
         system->collision_callbacks[i] = NULL;
+        system->body_indices[i] = -1;
+        system->local_positions[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
     }
     
     return system;
@@ -357,23 +631,233 @@ void DestroySphereSystem(SphereSystem* system) {
     if (system->is_sleeping) free(system->is_sleeping);
     if (system->sleep_timers) free(system->sleep_timers);
     if (system->collision_callbacks) free(system->collision_callbacks);
+    if (system->body_indices) free(system->body_indices);
+    if (system->local_positions) free(system->local_positions);
     free(system);
 }
 
-int AddSphere(PhysicsWorld* world, Vec3 position, float radius) {
-    if (!world || !world->spheres) return -1;
-    SphereSystem* system = world->spheres;
-    if (!system || system->count >= system->capacity) return -1;
+int AddRigidBody(PhysicsWorld* world, Vec3 position, Quat rotation) {
+    if (!world || !world->bodies) return -1;
+    RigidBodySystem* system = world->bodies;
+    if (system->count >= system->capacity) return -1;
     
-    int index = system->count;
+    int index = system->count++;
     system->positions[index] = position;
-    system->radii[index] = radius;
+    system->rotations[index] = QuatNormalize(rotation);
     system->velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
     system->forces[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
     system->masses[index] = 1.0f;
     system->angular_velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
     system->torques[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
-    system->inertias[index] = (2.0f / 5.0f) * system->masses[index] * radius * radius;
+    system->inertias[index] = (Vec3){ 1.0f, 1.0f, 1.0f };
+    system->is_static[index] = false;
+    system->is_sleeping[index] = false;
+    system->sleep_timers[index] = 0.0f;
+    return index;
+}
+
+void SetBodyMass(PhysicsWorld* world, int bodyIndex, float mass) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count || mass <= 0.0f) return;
+    world->bodies->masses[bodyIndex] = mass;
+}
+
+void SetBodyInertia(PhysicsWorld* world, int bodyIndex, Vec3 inertia) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    
+    const float min_inertia = 1e-6f;
+    world->bodies->inertias[bodyIndex] = (Vec3){
+        fmaxf(inertia.x, min_inertia),
+        fmaxf(inertia.y, min_inertia),
+        fmaxf(inertia.z, min_inertia)
+    };
+}
+
+void SetBodyStatic(PhysicsWorld* world, int bodyIndex, bool is_static) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    
+    RigidBodySystem* system = world->bodies;
+    system->is_static[bodyIndex] = is_static;
+    
+    if (is_static) {
+        system->velocities[bodyIndex] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->angular_velocities[bodyIndex] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->forces[bodyIndex] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->torques[bodyIndex] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    }
+}
+
+void AddBodyForce(PhysicsWorld* world, int bodyIndex, Vec3 force) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    
+    if (world->bodies->is_sleeping[bodyIndex]) {
+        world->bodies->is_sleeping[bodyIndex] = false;
+        world->bodies->sleep_timers[bodyIndex] = 0.0f;
+    }
+    
+    world->bodies->forces[bodyIndex] = Vec3Add(world->bodies->forces[bodyIndex], force);
+}
+
+void AddBodyTorque(PhysicsWorld* world, int bodyIndex, Vec3 torque) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    
+    if (world->bodies->is_sleeping[bodyIndex]) {
+        world->bodies->is_sleeping[bodyIndex] = false;
+        world->bodies->sleep_timers[bodyIndex] = 0.0f;
+    }
+    
+    world->bodies->torques[bodyIndex] = Vec3Add(world->bodies->torques[bodyIndex], torque);
+}
+
+void SetBodyVelocity(PhysicsWorld* world, int bodyIndex, Vec3 velocity) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    world->bodies->velocities[bodyIndex] = velocity;
+    world->bodies->is_sleeping[bodyIndex] = false;
+    world->bodies->sleep_timers[bodyIndex] = 0.0f;
+}
+
+void SetBodyAngularVelocity(PhysicsWorld* world, int bodyIndex, Vec3 angular_velocity) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    world->bodies->angular_velocities[bodyIndex] = angular_velocity;
+    world->bodies->is_sleeping[bodyIndex] = false;
+    world->bodies->sleep_timers[bodyIndex] = 0.0f;
+}
+
+void SetBodyInertiaAuto(PhysicsWorld* world, int bodyIndex) {
+    if (!world || !world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return;
+    
+    float total_volume = 0.0f;
+    for (int i = 0; world->spheres && i < world->spheres->count; i++) {
+        if (world->spheres->body_indices[i] != bodyIndex) continue;
+        float r = world->spheres->radii[i];
+        total_volume += (4.0f / 3.0f) * PHYSICS_PI * r * r * r;
+    }
+    for (int i = 0; world->boxes && i < world->boxes->count; i++) {
+        if (world->boxes->body_indices[i] != bodyIndex) continue;
+        Vec3 s = world->boxes->sizes[i];
+        total_volume += (s.x * 2.0f) * (s.y * 2.0f) * (s.z * 2.0f);
+    }
+    
+    if (total_volume <= 0.0f) return;
+    
+    float body_mass = world->bodies->masses[bodyIndex];
+    Vec3 inertia = { 0.0f, 0.0f, 0.0f };
+    
+    for (int i = 0; world->spheres && i < world->spheres->count; i++) {
+        if (world->spheres->body_indices[i] != bodyIndex) continue;
+        float r = world->spheres->radii[i];
+        float volume = (4.0f / 3.0f) * PHYSICS_PI * r * r * r;
+        float mass = body_mass * (volume / total_volume);
+        float local_inertia = (2.0f / 5.0f) * mass * r * r;
+        Vec3 offset = world->spheres->local_positions[i];
+        float offset_sq = Vec3Dot(offset, offset);
+        inertia.x += local_inertia + mass * (offset_sq - offset.x * offset.x);
+        inertia.y += local_inertia + mass * (offset_sq - offset.y * offset.y);
+        inertia.z += local_inertia + mass * (offset_sq - offset.z * offset.z);
+        world->spheres->masses[i] = mass;
+        world->spheres->inertias[i] = local_inertia;
+    }
+    
+    for (int i = 0; world->boxes && i < world->boxes->count; i++) {
+        if (world->boxes->body_indices[i] != bodyIndex) continue;
+        Vec3 s = world->boxes->sizes[i];
+        float w = s.x * 2.0f;
+        float h = s.y * 2.0f;
+        float d = s.z * 2.0f;
+        float volume = w * h * d;
+        float mass = body_mass * (volume / total_volume);
+        Vec3 local_inertia = {
+            (mass / 12.0f) * (h*h + d*d),
+            (mass / 12.0f) * (w*w + d*d),
+            (mass / 12.0f) * (w*w + h*h)
+        };
+        Vec3 offset = world->boxes->local_positions[i];
+        float offset_sq = Vec3Dot(offset, offset);
+        inertia.x += local_inertia.x + mass * (offset_sq - offset.x * offset.x);
+        inertia.y += local_inertia.y + mass * (offset_sq - offset.y * offset.y);
+        inertia.z += local_inertia.z + mass * (offset_sq - offset.z * offset.z);
+        world->boxes->masses[i] = mass;
+        world->boxes->inertias[i] = local_inertia;
+    }
+    
+    SetBodyInertia(world, bodyIndex, inertia);
+}
+
+void SyncCollidersFromBodies(PhysicsWorld* world) {
+    if (!world || !world->bodies) return;
+    
+    if (world->spheres) {
+        for (int i = 0; i < world->spheres->count; i++) {
+            int bodyIndex = world->spheres->body_indices[i];
+            if (bodyIndex < 0 || bodyIndex >= world->bodies->count) continue;
+            
+            Vec3 local_world = QuatRotateVec3(world->bodies->rotations[bodyIndex], world->spheres->local_positions[i]);
+            world->spheres->positions[i] = Vec3Add(world->bodies->positions[bodyIndex], local_world);
+            world->spheres->velocities[i] = world->bodies->velocities[bodyIndex];
+            world->spheres->forces[i] = world->bodies->forces[bodyIndex];
+            world->spheres->masses[i] = world->bodies->masses[bodyIndex];
+            world->spheres->angular_velocities[i] = world->bodies->angular_velocities[bodyIndex];
+            world->spheres->torques[i] = world->bodies->torques[bodyIndex];
+            world->spheres->is_static[i] = world->bodies->is_static[bodyIndex];
+            world->spheres->is_sleeping[i] = world->bodies->is_sleeping[bodyIndex];
+            world->spheres->sleep_timers[i] = world->bodies->sleep_timers[bodyIndex];
+        }
+    }
+    
+    if (world->boxes) {
+        for (int i = 0; i < world->boxes->count; i++) {
+            int bodyIndex = world->boxes->body_indices[i];
+            if (bodyIndex < 0 || bodyIndex >= world->bodies->count) continue;
+            
+            Vec3 local_world = QuatRotateVec3(world->bodies->rotations[bodyIndex], world->boxes->local_positions[i]);
+            world->boxes->positions[i] = Vec3Add(world->bodies->positions[bodyIndex], local_world);
+            world->boxes->rotations[i] = QuatMultiply(world->bodies->rotations[bodyIndex], world->boxes->local_rotations[i]);
+            world->boxes->velocities[i] = world->bodies->velocities[bodyIndex];
+            world->boxes->forces[i] = world->bodies->forces[bodyIndex];
+            world->boxes->masses[i] = world->bodies->masses[bodyIndex];
+            world->boxes->angular_velocities[i] = world->bodies->angular_velocities[bodyIndex];
+            world->boxes->torques[i] = world->bodies->torques[bodyIndex];
+            world->boxes->is_static[i] = world->bodies->is_static[bodyIndex];
+            world->boxes->is_sleeping[i] = world->bodies->is_sleeping[bodyIndex];
+            world->boxes->sleep_timers[i] = world->bodies->sleep_timers[bodyIndex];
+        }
+    }
+}
+
+int AddSphere(PhysicsWorld* world, Vec3 position, float radius) {
+    int bodyIndex = AddRigidBody(world, position, QuatIdentity());
+    if (bodyIndex < 0) return -1;
+    
+    int colliderIndex = AddSphereCollider(world, bodyIndex, (Vec3){ 0.0f, 0.0f, 0.0f }, radius);
+    if (colliderIndex < 0) {
+        world->bodies->count--;
+        return -1;
+    }
+    
+    return bodyIndex;
+}
+
+int AddSphereCollider(PhysicsWorld* world, int bodyIndex, Vec3 localPosition, float radius) {
+    if (!world || !world->spheres) return -1;
+    SphereSystem* system = world->spheres;
+    if (!world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return -1;
+    if (!system || system->count >= system->capacity) return -1;
+    
+    int index = system->count;
+    system->body_indices[index] = bodyIndex;
+    system->local_positions[index] = localPosition;
+    system->positions[index] = Vec3Add(world->bodies->positions[bodyIndex], QuatRotateVec3(world->bodies->rotations[bodyIndex], localPosition));
+    system->radii[index] = radius;
+    system->velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    system->forces[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    system->masses[index] = world->bodies->masses[bodyIndex];
+    system->angular_velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    system->torques[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    system->inertias[index] = (2.0f / 5.0f) * world->bodies->masses[bodyIndex] * radius * radius;
+    world->bodies->inertias[bodyIndex] = (Vec3){ system->inertias[index], system->inertias[index], system->inertias[index] };
+    system->is_static[index] = world->bodies->is_static[bodyIndex];
+    system->is_sleeping[index] = world->bodies->is_sleeping[bodyIndex];
+    system->sleep_timers[index] = world->bodies->sleep_timers[bodyIndex];
+    system->collision_callbacks[index] = NULL;
     system->count++;
     
     return index;
@@ -391,9 +875,12 @@ void SetSphereMass(PhysicsWorld* world, int index, float mass) {
     if (!system || index < 0 || index >= system->count || mass <= 0.0f) return;
     
     system->masses[index] = mass;
+    int bodyIndex = system->body_indices[index];
+    SetBodyMass(world, bodyIndex, mass);
     
     float radius = system->radii[index];
     system->inertias[index] = (2.0f / 5.0f) * mass * radius * radius;
+    SetBodyInertia(world, bodyIndex, (Vec3){ system->inertias[index], system->inertias[index], system->inertias[index] });
 }
 
 void SetSphereStatic(PhysicsWorld* world, int index, bool is_static) {
@@ -402,6 +889,7 @@ void SetSphereStatic(PhysicsWorld* world, int index, bool is_static) {
     if (!system || index < 0 || index >= system->count) return;
     
     system->is_static[index] = is_static;
+    SetBodyStatic(world, system->body_indices[index], is_static);
     
     if (is_static) {
         system->velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
@@ -416,12 +904,7 @@ void AddSphereForce(PhysicsWorld* world, int index, Vec3 force) {
     SphereSystem* system = world->spheres;
     if (!system || index < 0 || index >= system->count) return;
     
-    // Wake up sleeping objects when force is applied
-    if (system->is_sleeping[index]) {
-        system->is_sleeping[index] = false;
-        system->sleep_timers[index] = 0.0f;
-    }
-    
+    AddBodyForce(world, system->body_indices[index], force);
     system->forces[index] = Vec3Add(system->forces[index], force);
 }
 
@@ -430,12 +913,7 @@ void AddSphereTorque(PhysicsWorld* world, int index, Vec3 torque) {
     SphereSystem* system = world->spheres;
     if (!system || index < 0 || index >= system->count) return;
     
-    // Wake up sleeping objects when torque is applied
-    if (system->is_sleeping[index]) {
-        system->is_sleeping[index] = false;
-        system->sleep_timers[index] = 0.0f;
-    }
-    
+    AddBodyTorque(world, system->body_indices[index], torque);
     system->torques[index] = Vec3Add(system->torques[index], torque);
 }
 
@@ -656,13 +1134,17 @@ BoxSystem* CreateBoxSystem(int capacity) {
     system->is_sleeping = (bool*)malloc(sizeof(bool) * capacity);
     system->sleep_timers = (float*)malloc(sizeof(float) * capacity);
     system->collision_callbacks = (OnCollision*)malloc(sizeof(OnCollision) * capacity);
+    system->body_indices = (int*)malloc(sizeof(int) * capacity);
+    system->local_positions = (Vec3*)malloc(sizeof(Vec3) * capacity);
+    system->local_rotations = (Quat*)malloc(sizeof(Quat) * capacity);
     system->count = 0;
     system->capacity = capacity;
     
     if (!system->positions || !system->sizes || !system->rotations || 
         !system->velocities || !system->forces || !system->masses ||
         !system->angular_velocities || !system->torques || !system->inertias || 
-        !system->is_static || !system->is_sleeping || !system->sleep_timers || !system->collision_callbacks) {
+        !system->is_static || !system->is_sleeping || !system->sleep_timers || !system->collision_callbacks ||
+        !system->body_indices || !system->local_positions || !system->local_rotations) {
         DestroyBoxSystem(system);
         return NULL;
     }
@@ -681,6 +1163,9 @@ BoxSystem* CreateBoxSystem(int capacity) {
         system->is_sleeping[i] = false;
         system->sleep_timers[i] = 0.0f;
         system->collision_callbacks[i] = NULL;
+        system->body_indices[i] = -1;
+        system->local_positions[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        system->local_rotations[i] = QuatIdentity();
     }
     
     return system;
@@ -702,25 +1187,45 @@ void DestroyBoxSystem(BoxSystem* system) {
     if (system->is_sleeping) free(system->is_sleeping);
     if (system->sleep_timers) free(system->sleep_timers);
     if (system->collision_callbacks) free(system->collision_callbacks);
+    if (system->body_indices) free(system->body_indices);
+    if (system->local_positions) free(system->local_positions);
+    if (system->local_rotations) free(system->local_rotations);
     free(system);
 }
 
 int AddBox(PhysicsWorld* world, Vec3 position, Vec3 size, Quat rotation) {
+    int bodyIndex = AddRigidBody(world, position, rotation);
+    if (bodyIndex < 0) return -1;
+    
+    int colliderIndex = AddBoxCollider(world, bodyIndex, (Vec3){ 0.0f, 0.0f, 0.0f }, QuatIdentity(), size);
+    if (colliderIndex < 0) {
+        world->bodies->count--;
+        return -1;
+    }
+    
+    return bodyIndex;
+}
+
+int AddBoxCollider(PhysicsWorld* world, int bodyIndex, Vec3 localPosition, Quat localRotation, Vec3 size) {
     if (!world || !world->boxes) return -1;
     BoxSystem* system = world->boxes;
+    if (!world->bodies || bodyIndex < 0 || bodyIndex >= world->bodies->count) return -1;
     if (!system || system->count >= system->capacity) return -1;
     
     int index = system->count;
-    system->positions[index] = position;
+    system->body_indices[index] = bodyIndex;
+    system->local_positions[index] = localPosition;
+    system->local_rotations[index] = QuatNormalize(localRotation);
+    system->positions[index] = Vec3Add(world->bodies->positions[bodyIndex], QuatRotateVec3(world->bodies->rotations[bodyIndex], localPosition));
     system->sizes[index] = size;
-    system->rotations[index] = rotation;
-    system->velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    system->rotations[index] = QuatMultiply(world->bodies->rotations[bodyIndex], system->local_rotations[index]);
+    system->velocities[index] = world->bodies->velocities[bodyIndex];
     system->forces[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
-    system->masses[index] = 1.0f;
-    system->angular_velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
+    system->masses[index] = world->bodies->masses[bodyIndex];
+    system->angular_velocities[index] = world->bodies->angular_velocities[bodyIndex];
     system->torques[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
     
-    float m = system->masses[index];
+    float m = world->bodies->masses[bodyIndex];
     float w = size.x * 2.0f;
     float h = size.y * 2.0f;
     float d = size.z * 2.0f;
@@ -729,11 +1234,12 @@ int AddBox(PhysicsWorld* world, Vec3 position, Vec3 size, Quat rotation) {
         (m / 12.0f) * (w*w + d*d),
         (m / 12.0f) * (w*w + h*h)
     };
+    world->bodies->inertias[bodyIndex] = system->inertias[index];
     
     // Initialize sleeping/static state explicitly
-    system->is_static[index] = false;
-    system->is_sleeping[index] = false;
-    system->sleep_timers[index] = 0.0f;
+    system->is_static[index] = world->bodies->is_static[bodyIndex];
+    system->is_sleeping[index] = world->bodies->is_sleeping[bodyIndex];
+    system->sleep_timers[index] = world->bodies->sleep_timers[bodyIndex];
     
     // Ensure forces and torques are completely zeroed (double-check for first frame issues)
     system->forces[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
@@ -757,6 +1263,8 @@ void SetBoxMass(PhysicsWorld* world, int index, float mass) {
     if (!system || index < 0 || index >= system->count || mass <= 0.0f) return;
     
     system->masses[index] = mass;
+    int bodyIndex = system->body_indices[index];
+    SetBodyMass(world, bodyIndex, mass);
     
     Vec3 size = system->sizes[index];
     float w = size.x * 2.0f;
@@ -767,6 +1275,7 @@ void SetBoxMass(PhysicsWorld* world, int index, float mass) {
         (mass / 12.0f) * (w*w + d*d),
         (mass / 12.0f) * (w*w + h*h)
     };
+    SetBodyInertia(world, bodyIndex, system->inertias[index]);
 }
 
 void SetBoxStatic(PhysicsWorld* world, int index, bool is_static) {
@@ -775,6 +1284,7 @@ void SetBoxStatic(PhysicsWorld* world, int index, bool is_static) {
     if (!system || index < 0 || index >= system->count) return;
     
     system->is_static[index] = is_static;
+    SetBodyStatic(world, system->body_indices[index], is_static);
     
     if (is_static) {
         system->velocities[index] = (Vec3){ 0.0f, 0.0f, 0.0f };
@@ -789,12 +1299,7 @@ void AddBoxForce(PhysicsWorld* world, int index, Vec3 force) {
     BoxSystem* system = world->boxes;
     if (!system || index < 0 || index >= system->count) return;
     
-    // Wake up sleeping objects when force is applied
-    if (system->is_sleeping[index]) {
-        system->is_sleeping[index] = false;
-        system->sleep_timers[index] = 0.0f;
-    }
-    
+    AddBodyForce(world, system->body_indices[index], force);
     system->forces[index] = Vec3Add(system->forces[index], force);
 }
 
@@ -803,12 +1308,7 @@ void AddBoxTorque(PhysicsWorld* world, int index, Vec3 torque) {
     BoxSystem* system = world->boxes;
     if (!system || index < 0 || index >= system->count) return;
     
-    // Wake up sleeping objects when torque is applied
-    if (system->is_sleeping[index]) {
-        system->is_sleeping[index] = false;
-        system->sleep_timers[index] = 0.0f;
-    }
-    
+    AddBodyTorque(world, system->body_indices[index], torque);
     system->torques[index] = Vec3Add(system->torques[index], torque);
 }
 
@@ -1169,6 +1669,175 @@ void ClearConstraints(ConstraintCollection* constraints) {
     constraints->count = 0;
 }
 
+Vec3 GetConstraintBodyVelocityAtPoint(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 point);
+
+JointSystem* CreateJointSystem(int capacity) {
+    JointSystem* system = (JointSystem*)malloc(sizeof(JointSystem));
+    if (!system) return NULL;
+
+    system->joints = (PhysicsJoint*)malloc(sizeof(PhysicsJoint) * capacity);
+    if (!system->joints) {
+        free(system);
+        return NULL;
+    }
+
+    system->count = 0;
+    system->capacity = capacity;
+
+    for (int i = 0; i < capacity; i++) {
+        memset(&system->joints[i], 0, sizeof(PhysicsJoint));
+        system->joints[i].bodyA_index = -1;
+        system->joints[i].bodyB_index = -1;
+        system->joints[i].reference_rotation = QuatIdentity();
+    }
+
+    return system;
+}
+
+void DestroyJointSystem(JointSystem* system) {
+    if (!system) return;
+
+    if (system->joints) free(system->joints);
+    free(system);
+}
+
+static bool IsValidBodyIndex(PhysicsWorld* world, int bodyIndex) {
+    return world && world->bodies && bodyIndex >= 0 && bodyIndex < world->bodies->count;
+}
+
+static Vec3 BodyWorldPoint(PhysicsWorld* world, int bodyIndex, Vec3 localPoint) {
+    Vec3 rotated = QuatRotateVec3(world->bodies->rotations[bodyIndex], localPoint);
+    return Vec3Add(world->bodies->positions[bodyIndex], rotated);
+}
+
+static Vec3 BodyLocalPoint(PhysicsWorld* world, int bodyIndex, Vec3 worldPoint) {
+    Vec3 relative = Vec3Sub(worldPoint, world->bodies->positions[bodyIndex]);
+    return QuatRotateVec3(QuatConjugate(world->bodies->rotations[bodyIndex]), relative);
+}
+
+static Vec3 BodyLocalVector(PhysicsWorld* world, int bodyIndex, Vec3 worldVector) {
+    return QuatRotateVec3(QuatConjugate(world->bodies->rotations[bodyIndex]), worldVector);
+}
+
+int AddFixedJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor) {
+    if (!world || !world->joints || world->joints->count >= world->joints->capacity) return -1;
+    if (!IsValidBodyIndex(world, bodyA) || !IsValidBodyIndex(world, bodyB) || bodyA == bodyB) return -1;
+
+    int index = world->joints->count++;
+    PhysicsJoint* joint = &world->joints->joints[index];
+    memset(joint, 0, sizeof(PhysicsJoint));
+
+    joint->type = PHYSICS_JOINT_FIXED;
+    joint->bodyA_index = bodyA;
+    joint->bodyB_index = bodyB;
+    joint->local_anchor_a = BodyLocalPoint(world, bodyA, worldAnchor);
+    joint->local_anchor_b = BodyLocalPoint(world, bodyB, worldAnchor);
+    joint->local_axis_a = (Vec3){ 1.0f, 0.0f, 0.0f };
+    joint->local_axis_b = BodyLocalVector(world, bodyB, QuatRotateVec3(world->bodies->rotations[bodyA], joint->local_axis_a));
+    joint->reference_rotation = QuatMultiply(QuatConjugate(world->bodies->rotations[bodyA]), world->bodies->rotations[bodyB]);
+
+    return index;
+}
+
+int AddHingeJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor, Vec3 worldAxis) {
+    if (!world || !world->joints || world->joints->count >= world->joints->capacity) return -1;
+    if (!IsValidBodyIndex(world, bodyA) || !IsValidBodyIndex(world, bodyB) || bodyA == bodyB) return -1;
+
+    Vec3 axis = Vec3Normalize(worldAxis);
+    if (Vec3Length(axis) < world->settings.vector_normalize_epsilon) return -1;
+
+    int index = world->joints->count++;
+    PhysicsJoint* joint = &world->joints->joints[index];
+    memset(joint, 0, sizeof(PhysicsJoint));
+
+    joint->type = PHYSICS_JOINT_HINGE;
+    joint->bodyA_index = bodyA;
+    joint->bodyB_index = bodyB;
+    joint->local_anchor_a = BodyLocalPoint(world, bodyA, worldAnchor);
+    joint->local_anchor_b = BodyLocalPoint(world, bodyB, worldAnchor);
+    joint->local_axis_a = BodyLocalVector(world, bodyA, axis);
+    joint->local_axis_b = BodyLocalVector(world, bodyB, axis);
+    joint->reference_rotation = QuatMultiply(QuatConjugate(world->bodies->rotations[bodyA]), world->bodies->rotations[bodyB]);
+    joint->max_motor_impulse = 0.0f;
+
+    return index;
+}
+
+int AddSpringJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchorA, Vec3 worldAnchorB,
+                   float rest_length, float stiffness, float damping) {
+    if (!world || !world->joints || world->joints->count >= world->joints->capacity) return -1;
+    if (!IsValidBodyIndex(world, bodyA) || !IsValidBodyIndex(world, bodyB) || bodyA == bodyB) return -1;
+
+    int index = world->joints->count++;
+    PhysicsJoint* joint = &world->joints->joints[index];
+    memset(joint, 0, sizeof(PhysicsJoint));
+
+    joint->type = PHYSICS_JOINT_SPRING;
+    joint->bodyA_index = bodyA;
+    joint->bodyB_index = bodyB;
+    joint->local_anchor_a = BodyLocalPoint(world, bodyA, worldAnchorA);
+    joint->local_anchor_b = BodyLocalPoint(world, bodyB, worldAnchorB);
+    joint->local_axis_a = (Vec3){ 1.0f, 0.0f, 0.0f };
+    joint->local_axis_b = (Vec3){ 1.0f, 0.0f, 0.0f };
+    joint->reference_rotation = QuatIdentity();
+    joint->rest_length = fmaxf(rest_length, 0.0f);
+    joint->stiffness = fmaxf(stiffness, 0.0f);
+    joint->damping = fmaxf(damping, 0.0f);
+
+    return index;
+}
+
+void SetHingeMotor(PhysicsWorld* world, int jointIndex, bool enabled, float motor_speed, float max_motor_impulse) {
+    if (!world || !world->joints || jointIndex < 0 || jointIndex >= world->joints->count) return;
+
+    PhysicsJoint* joint = &world->joints->joints[jointIndex];
+    if (joint->type != PHYSICS_JOINT_HINGE) return;
+
+    joint->enable_motor = enabled;
+    joint->motor_speed = motor_speed;
+    joint->max_motor_impulse = fmaxf(max_motor_impulse, 0.0f);
+}
+
+void ApplySpringJointForces(PhysicsWorld* world) {
+    if (!world || !world->joints || !world->bodies) return;
+
+    for (int i = 0; i < world->joints->count; i++) {
+        PhysicsJoint* joint = &world->joints->joints[i];
+        if (joint->type != PHYSICS_JOINT_SPRING) continue;
+        if (!IsValidBodyIndex(world, joint->bodyA_index) || !IsValidBodyIndex(world, joint->bodyB_index)) continue;
+
+        int bodyA = joint->bodyA_index;
+        int bodyB = joint->bodyB_index;
+        Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
+        Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
+        Vec3 delta = Vec3Sub(anchorB, anchorA);
+        float length = Vec3Length(delta);
+        if (length < world->settings.vector_normalize_epsilon) continue;
+
+        Vec3 axis = Vec3Scale(delta, 1.0f / length);
+        Vec3 velocityA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
+        Vec3 velocityB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
+        float relativeSpeed = Vec3Dot(Vec3Sub(velocityB, velocityA), axis);
+
+        float displacement = length - joint->rest_length;
+        float forceMagnitude = joint->stiffness * displacement + joint->damping * relativeSpeed;
+        Vec3 force = Vec3Scale(axis, forceMagnitude);
+
+        Vec3 rA = Vec3Sub(anchorA, world->bodies->positions[bodyA]);
+        Vec3 rB = Vec3Sub(anchorB, world->bodies->positions[bodyB]);
+
+        if (!world->bodies->is_static[bodyA]) {
+            AddBodyForce(world, bodyA, force);
+            AddBodyTorque(world, bodyA, Vec3Cross(rA, force));
+        }
+        if (!world->bodies->is_static[bodyB]) {
+            Vec3 opposite = Vec3Scale(force, -1.0f);
+            AddBodyForce(world, bodyB, opposite);
+            AddBodyTorque(world, bodyB, Vec3Cross(rB, opposite));
+        }
+    }
+}
+
 // ============================================================================
 // CONSTRAINT-BASED COLLISION RESOLUTION
 // ============================================================================
@@ -1190,8 +1859,10 @@ void GenerateContactConstraints(PhysicsWorld* world) {
         // Copy basic contact data
         constraint->bodyA_type = contact->bodyA_type;
         constraint->bodyA_index = contact->bodyA_index;
+        constraint->colliderA_index = contact->colliderA_index;
         constraint->bodyB_type = contact->bodyB_type;
         constraint->bodyB_index = contact->bodyB_index;
+        constraint->colliderB_index = contact->colliderB_index;
         constraint->contact_point = contact->contact_point;
         constraint->contact_normal = contact->contact_normal;
         constraint->penetration = contact->penetration;
@@ -1222,6 +1893,7 @@ void SolveConstraints(PhysicsWorld* world) {
     // Solve velocity constraints iteratively
     for (int iter = 0; iter < world->settings.solver_iterations; iter++) {
         SolveVelocityConstraints(world);
+        SolveJointVelocityConstraints(world);
     }
 }
 
@@ -1231,65 +1903,44 @@ void SolveConstraints(PhysicsWorld* world) {
 
 // Get body velocity at a point
 Vec3 GetConstraintBodyVelocityAtPoint(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 point) {
-    if (bodyType == 0) { // Sphere
-        if (bodyIndex < 0 || bodyIndex >= world->spheres->count || world->spheres->is_static[bodyIndex]) 
-            return (Vec3){0, 0, 0};
-        
-        Vec3 linear_vel = world->spheres->velocities[bodyIndex];
-        Vec3 angular_vel = world->spheres->angular_velocities[bodyIndex];
-        Vec3 body_pos = world->spheres->positions[bodyIndex];
-        Vec3 r = Vec3Sub(point, body_pos);
-        Vec3 angular_component = Vec3Cross(angular_vel, r);
-        
-        return Vec3Add(linear_vel, angular_component);
-        
-    } else if (bodyType == 1) { // Box
-        if (bodyIndex < 0 || bodyIndex >= world->boxes->count || world->boxes->is_static[bodyIndex]) 
-            return (Vec3){0, 0, 0};
-        
-        Vec3 linear_vel = world->boxes->velocities[bodyIndex];
-        Vec3 angular_vel = world->boxes->angular_velocities[bodyIndex];
-        Vec3 body_pos = world->boxes->positions[bodyIndex];
-        Vec3 r = Vec3Sub(point, body_pos);
-        Vec3 angular_component = Vec3Cross(angular_vel, r);
-        
-        return Vec3Add(linear_vel, angular_component);
-        
-    } else { // SDF - static
+    if (bodyType == 2 || !world || !world->bodies) {
         return (Vec3){0, 0, 0};
     }
+    if (bodyIndex < 0 || bodyIndex >= world->bodies->count || world->bodies->is_static[bodyIndex]) {
+        return (Vec3){0, 0, 0};
+    }
+    
+    Vec3 linear_vel = world->bodies->velocities[bodyIndex];
+    Vec3 angular_vel = world->bodies->angular_velocities[bodyIndex];
+    Vec3 body_pos = world->bodies->positions[bodyIndex];
+    Vec3 r = Vec3Sub(point, body_pos);
+    Vec3 angular_component = Vec3Cross(angular_vel, r);
+    
+    return Vec3Add(linear_vel, angular_component);
 }
 
 // Get body inverse mass
 float GetConstraintBodyInverseMass(PhysicsWorld* world, int bodyType, int bodyIndex) {
-    if (bodyType == 0) { // Sphere
-        if (bodyIndex < 0 || bodyIndex >= world->spheres->count || world->spheres->is_static[bodyIndex]) 
-            return 0.0f;
-        return 1.0f / world->spheres->masses[bodyIndex];
-    } else if (bodyType == 1) { // Box
-        if (bodyIndex < 0 || bodyIndex >= world->boxes->count || world->boxes->is_static[bodyIndex]) 
-            return 0.0f;
-        return 1.0f / world->boxes->masses[bodyIndex];
-    } else { // SDF - static
+    if (bodyType == 2 || !world || !world->bodies) return 0.0f;
+    if (bodyIndex < 0 || bodyIndex >= world->bodies->count || world->bodies->is_static[bodyIndex]) {
         return 0.0f;
     }
+    return 1.0f / world->bodies->masses[bodyIndex];
 }
 
-// Get body inverse inertia (simplified - assumes scalar inertia for spheres)
+// Get body inverse inertia in local body space
 Vec3 GetConstraintBodyInverseInertia(PhysicsWorld* world, int bodyType, int bodyIndex) {
-    if (bodyType == 0) { // Sphere
-        if (bodyIndex < 0 || bodyIndex >= world->spheres->count || world->spheres->is_static[bodyIndex]) 
-            return (Vec3){0, 0, 0};
-        float inv_inertia = 1.0f / world->spheres->inertias[bodyIndex];
-        return (Vec3){inv_inertia, inv_inertia, inv_inertia};
-    } else if (bodyType == 1) { // Box
-        if (bodyIndex < 0 || bodyIndex >= world->boxes->count || world->boxes->is_static[bodyIndex]) 
-            return (Vec3){0, 0, 0};
-        Vec3 inertia = world->boxes->inertias[bodyIndex];
-        return (Vec3){1.0f / inertia.x, 1.0f / inertia.y, 1.0f / inertia.z};
-    } else { // SDF - static
+    if (bodyType == 2 || !world || !world->bodies) return (Vec3){0, 0, 0};
+    if (bodyIndex < 0 || bodyIndex >= world->bodies->count || world->bodies->is_static[bodyIndex]) {
         return (Vec3){0, 0, 0};
     }
+    
+    Vec3 inertia = world->bodies->inertias[bodyIndex];
+    return (Vec3){
+        (inertia.x > 1e-6f) ? 1.0f / inertia.x : 0.0f,
+        (inertia.y > 1e-6f) ? 1.0f / inertia.y : 0.0f,
+        (inertia.z > 1e-6f) ? 1.0f / inertia.z : 0.0f
+    };
 }
 
 void PreSolveConstraints(PhysicsWorld* world) {
@@ -1301,14 +1952,10 @@ void PreSolveConstraints(PhysicsWorld* world) {
         ContactConstraint* c = &world->constraints->constraints[i];
         
         // Get body data
-        Vec3 rA = Vec3Sub(c->contact_point, 
-                         (c->bodyA_type == 0) ? world->spheres->positions[c->bodyA_index] 
-                                              : (c->bodyA_type == 1) ? world->boxes->positions[c->bodyA_index]
-                                                                     : c->contact_point);
-        Vec3 rB = Vec3Sub(c->contact_point, 
-                         (c->bodyB_type == 0) ? world->spheres->positions[c->bodyB_index] 
-                                              : (c->bodyB_type == 1) ? world->boxes->positions[c->bodyB_index]
-                                                                     : c->contact_point);
+        Vec3 posA = (c->bodyA_type == 2 || c->bodyA_index < 0) ? c->contact_point : world->bodies->positions[c->bodyA_index];
+        Vec3 posB = (c->bodyB_type == 2 || c->bodyB_index < 0) ? c->contact_point : world->bodies->positions[c->bodyB_index];
+        Vec3 rA = Vec3Sub(c->contact_point, posA);
+        Vec3 rB = Vec3Sub(c->contact_point, posB);
         
         float invMassA = GetConstraintBodyInverseMass(world, c->bodyA_type, c->bodyA_index);
         float invMassB = GetConstraintBodyInverseMass(world, c->bodyB_type, c->bodyB_index);
@@ -1357,54 +2004,258 @@ void PreSolveConstraints(PhysicsWorld* world) {
 
 // Apply impulse to a body in the constraint solver
 void ApplyConstraintImpulse(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 linear_impulse, Vec3 angular_impulse) {
-    if (bodyType == 0) { // Sphere
-        if (bodyIndex < 0 || bodyIndex >= world->spheres->count || world->spheres->is_static[bodyIndex]) 
-            return;
-        
-        float invMass = 1.0f / world->spheres->masses[bodyIndex];
-        float invInertia = 1.0f / world->spheres->inertias[bodyIndex];
-        
-        world->spheres->velocities[bodyIndex] = Vec3Add(world->spheres->velocities[bodyIndex], 
-                                                       Vec3Scale(linear_impulse, invMass));
-        world->spheres->angular_velocities[bodyIndex] = Vec3Add(world->spheres->angular_velocities[bodyIndex], 
-                                                               Vec3Scale(angular_impulse, invInertia));
-        
-        // Wake up sleeping bodies
-        if (world->spheres->is_sleeping[bodyIndex]) {
-            world->spheres->is_sleeping[bodyIndex] = false;
-            world->spheres->sleep_timers[bodyIndex] = 0.0f;
+    if (bodyType == 2 || !world || !world->bodies) return;
+    if (bodyIndex < 0 || bodyIndex >= world->bodies->count || world->bodies->is_static[bodyIndex]) {
+        return;
+    }
+    
+    float invMass = 1.0f / world->bodies->masses[bodyIndex];
+    Vec3 invInertia = GetConstraintBodyInverseInertia(world, bodyType, bodyIndex);
+    
+    world->bodies->velocities[bodyIndex] = Vec3Add(world->bodies->velocities[bodyIndex],
+                                                  Vec3Scale(linear_impulse, invMass));
+    
+    Quat rotation = world->bodies->rotations[bodyIndex];
+    Vec3 localAngularImpulse = QuatRotateVec3(QuatConjugate(rotation), angular_impulse);
+    Vec3 localAngularDelta = (Vec3){
+        localAngularImpulse.x * invInertia.x,
+        localAngularImpulse.y * invInertia.y,
+        localAngularImpulse.z * invInertia.z
+    };
+    Vec3 worldAngularDelta = QuatRotateVec3(rotation, localAngularDelta);
+    
+    world->bodies->angular_velocities[bodyIndex] = Vec3Add(world->bodies->angular_velocities[bodyIndex],
+                                                          worldAngularDelta);
+    
+    if (world->bodies->is_sleeping[bodyIndex]) {
+        world->bodies->is_sleeping[bodyIndex] = false;
+        world->bodies->sleep_timers[bodyIndex] = 0.0f;
+    }
+}
+
+static Vec3 ApplyBodyInverseInertia(PhysicsWorld* world, int bodyIndex, Vec3 worldVector) {
+    if (!IsValidBodyIndex(world, bodyIndex) || world->bodies->is_static[bodyIndex]) {
+        return (Vec3){ 0.0f, 0.0f, 0.0f };
+    }
+
+    Vec3 invInertia = GetConstraintBodyInverseInertia(world, 0, bodyIndex);
+    Quat rotation = world->bodies->rotations[bodyIndex];
+    Vec3 localVector = QuatRotateVec3(QuatConjugate(rotation), worldVector);
+    Vec3 localResult = {
+        localVector.x * invInertia.x,
+        localVector.y * invInertia.y,
+        localVector.z * invInertia.z
+    };
+    return QuatRotateVec3(rotation, localResult);
+}
+
+static float CalculateJointLinearMass(PhysicsWorld* world, int bodyA, int bodyB, Vec3 rA, Vec3 rB, Vec3 axis) {
+    float invMassA = GetConstraintBodyInverseMass(world, 0, bodyA);
+    float invMassB = GetConstraintBodyInverseMass(world, 0, bodyB);
+    Vec3 rnA = Vec3Cross(rA, axis);
+    Vec3 rnB = Vec3Cross(rB, axis);
+
+    float k = invMassA + invMassB +
+              Vec3Dot(rnA, ApplyBodyInverseInertia(world, bodyA, rnA)) +
+              Vec3Dot(rnB, ApplyBodyInverseInertia(world, bodyB, rnB));
+
+    return (k > 1e-8f) ? 1.0f / k : 0.0f;
+}
+
+static float CalculateJointAngularMass(PhysicsWorld* world, int bodyA, int bodyB, Vec3 axis) {
+    Vec3 invA = ApplyBodyInverseInertia(world, bodyA, axis);
+    Vec3 invB = ApplyBodyInverseInertia(world, bodyB, axis);
+    float k = Vec3Dot(axis, Vec3Add(invA, invB));
+    return (k > 1e-8f) ? 1.0f / k : 0.0f;
+}
+
+static void SolveJointAnchorVelocity(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
+    Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
+    Vec3 rA = Vec3Sub(anchorA, world->bodies->positions[bodyA]);
+    Vec3 rB = Vec3Sub(anchorB, world->bodies->positions[bodyB]);
+    Vec3 error = Vec3Sub(anchorB, anchorA);
+    Vec3 axes[3] = {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f }
+    };
+    float biasFactor = world->settings.baumgarte_bias / world->dt;
+
+    for (int i = 0; i < 3; i++) {
+        Vec3 axis = axes[i];
+        Vec3 vA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
+        Vec3 vB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
+        float relVel = Vec3Dot(Vec3Sub(vB, vA), axis);
+        float bias = biasFactor * Vec3Dot(error, axis);
+        float mass = CalculateJointLinearMass(world, bodyA, bodyB, rA, rB, axis);
+        float impulseMagnitude = -(relVel + bias) * mass;
+        Vec3 impulse = Vec3Scale(axis, impulseMagnitude);
+
+        ApplyConstraintImpulse(world, 0, bodyA, Vec3Scale(impulse, -1.0f), Vec3Cross(rA, Vec3Scale(impulse, -1.0f)));
+        ApplyConstraintImpulse(world, 0, bodyB, impulse, Vec3Cross(rB, impulse));
+    }
+}
+
+static void SolveJointAngularVelocityVector(PhysicsWorld* world, int bodyA, int bodyB, Vec3 correctionVelocity) {
+    Vec3 axes[3] = {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f }
+    };
+
+    for (int i = 0; i < 3; i++) {
+        Vec3 axis = axes[i];
+        float component = Vec3Dot(correctionVelocity, axis);
+        float mass = CalculateJointAngularMass(world, bodyA, bodyB, axis);
+        float impulseMagnitude = -component * mass;
+        Vec3 impulse = Vec3Scale(axis, impulseMagnitude);
+
+        ApplyConstraintImpulse(world, 0, bodyA, (Vec3){ 0.0f, 0.0f, 0.0f }, Vec3Scale(impulse, -1.0f));
+        ApplyConstraintImpulse(world, 0, bodyB, (Vec3){ 0.0f, 0.0f, 0.0f }, impulse);
+    }
+}
+
+static Vec3 GetFixedJointAngularError(PhysicsWorld* world, PhysicsJoint* joint) {
+    Quat targetB = QuatMultiply(world->bodies->rotations[joint->bodyA_index], joint->reference_rotation);
+    Quat errorQuat = QuatMultiply(world->bodies->rotations[joint->bodyB_index], QuatConjugate(targetB));
+    errorQuat = QuatNormalize(errorQuat);
+
+    if (errorQuat.w < 0.0f) {
+        errorQuat.x = -errorQuat.x;
+        errorQuat.y = -errorQuat.y;
+        errorQuat.z = -errorQuat.z;
+        errorQuat.w = -errorQuat.w;
+    }
+
+    Vec3 axis;
+    float angle;
+    QuatToAxisAngle(errorQuat, &axis, &angle);
+    if (angle > PHYSICS_PI) {
+        angle -= 2.0f * PHYSICS_PI;
+    }
+
+    return Vec3Scale(axis, angle);
+}
+
+static void SolveJointAngularVelocity(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    Vec3 wA = world->bodies->angular_velocities[bodyA];
+    Vec3 wB = world->bodies->angular_velocities[bodyB];
+    Vec3 relW = Vec3Sub(wB, wA);
+    float biasFactor = world->settings.baumgarte_bias / world->dt;
+
+    if (joint->type == PHYSICS_JOINT_FIXED) {
+        Vec3 angularError = GetFixedJointAngularError(world, joint);
+        Vec3 correctionVelocity = Vec3Add(relW, Vec3Scale(angularError, biasFactor));
+        SolveJointAngularVelocityVector(world, bodyA, bodyB, correctionVelocity);
+    } else if (joint->type == PHYSICS_JOINT_HINGE) {
+        Vec3 axisA = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyA], joint->local_axis_a));
+        Vec3 axisB = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyB], joint->local_axis_b));
+        Vec3 hingeAxis = Vec3Normalize(Vec3Add(axisA, axisB));
+        if (Vec3Length(hingeAxis) < world->settings.vector_normalize_epsilon) {
+            hingeAxis = axisA;
         }
-        
-    } else if (bodyType == 1) { // Box
-        if (bodyIndex < 0 || bodyIndex >= world->boxes->count || world->boxes->is_static[bodyIndex]) 
-            return;
-        
-        float invMass = 1.0f / world->boxes->masses[bodyIndex];
-        Vec3 invInertia = GetConstraintBodyInverseInertia(world, bodyType, bodyIndex);
-        
-        world->boxes->velocities[bodyIndex] = Vec3Add(world->boxes->velocities[bodyIndex], 
-                                                     Vec3Scale(linear_impulse, invMass));
-        
-        // For boxes, need to transform angular impulse to local space
-        Quat rotation = world->boxes->rotations[bodyIndex];
-        Vec3 localAngularImpulse = QuatRotateVec3(QuatConjugate(rotation), angular_impulse);
-        Vec3 localAngularDelta = (Vec3){
-            localAngularImpulse.x * invInertia.x,
-            localAngularImpulse.y * invInertia.y,
-            localAngularImpulse.z * invInertia.z
-        };
-        Vec3 worldAngularDelta = QuatRotateVec3(rotation, localAngularDelta);
-        
-        world->boxes->angular_velocities[bodyIndex] = Vec3Add(world->boxes->angular_velocities[bodyIndex], 
-                                                             worldAngularDelta);
-        
-        // Wake up sleeping bodies
-        if (world->boxes->is_sleeping[bodyIndex]) {
-            world->boxes->is_sleeping[bodyIndex] = false;
-            world->boxes->sleep_timers[bodyIndex] = 0.0f;
+
+        Vec3 angularError = Vec3Cross(axisA, axisB);
+        Vec3 relPerp = Vec3Sub(relW, Vec3Scale(hingeAxis, Vec3Dot(relW, hingeAxis)));
+        Vec3 correctionVelocity = Vec3Add(relPerp, Vec3Scale(angularError, biasFactor));
+        SolveJointAngularVelocityVector(world, bodyA, bodyB, correctionVelocity);
+
+        if (joint->enable_motor && joint->max_motor_impulse > 0.0f) {
+            float relSpeed = Vec3Dot(Vec3Sub(world->bodies->angular_velocities[bodyB],
+                                             world->bodies->angular_velocities[bodyA]), hingeAxis);
+            float mass = CalculateJointAngularMass(world, bodyA, bodyB, hingeAxis);
+            float impulseMagnitude = (joint->motor_speed - relSpeed) * mass;
+            impulseMagnitude = fmaxf(-joint->max_motor_impulse, fminf(joint->max_motor_impulse, impulseMagnitude));
+            Vec3 impulse = Vec3Scale(hingeAxis, impulseMagnitude);
+            ApplyConstraintImpulse(world, 0, bodyA, (Vec3){ 0.0f, 0.0f, 0.0f }, Vec3Scale(impulse, -1.0f));
+            ApplyConstraintImpulse(world, 0, bodyB, (Vec3){ 0.0f, 0.0f, 0.0f }, impulse);
         }
     }
-    // SDF bodies are static - no impulse applied
+}
+
+void SolveJointVelocityConstraints(PhysicsWorld* world) {
+    if (!world || !world->joints || !world->bodies) return;
+
+    for (int i = 0; i < world->joints->count; i++) {
+        PhysicsJoint* joint = &world->joints->joints[i];
+        if (!IsValidBodyIndex(world, joint->bodyA_index) || !IsValidBodyIndex(world, joint->bodyB_index)) continue;
+
+        SolveJointAnchorVelocity(world, joint);
+        SolveJointAngularVelocity(world, joint);
+    }
+}
+
+static void ApplyBodyRotationCorrection(PhysicsWorld* world, int bodyIndex, Vec3 delta) {
+    if (!IsValidBodyIndex(world, bodyIndex) || world->bodies->is_static[bodyIndex]) return;
+
+    float angle = Vec3Length(delta);
+    if (angle < 1e-6f) return;
+
+    Vec3 axis = Vec3Scale(delta, 1.0f / angle);
+    Quat dq = QuatFromAxisAngle(axis, angle);
+    world->bodies->rotations[bodyIndex] = QuatNormalize(QuatMultiply(dq, world->bodies->rotations[bodyIndex]));
+}
+
+static void SolveJointAnchorPosition(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
+    Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
+    Vec3 error = Vec3Sub(anchorB, anchorA);
+
+    float invMassA = GetConstraintBodyInverseMass(world, 0, bodyA);
+    float invMassB = GetConstraintBodyInverseMass(world, 0, bodyB);
+    float totalInvMass = invMassA + invMassB;
+    if (totalInvMass <= 1e-8f) return;
+
+    Vec3 correction = Vec3Scale(error, 0.6f / totalInvMass);
+    if (invMassA > 0.0f) {
+        world->bodies->positions[bodyA] = Vec3Add(world->bodies->positions[bodyA], Vec3Scale(correction, invMassA));
+    }
+    if (invMassB > 0.0f) {
+        world->bodies->positions[bodyB] = Vec3Sub(world->bodies->positions[bodyB], Vec3Scale(correction, invMassB));
+    }
+}
+
+static void SolveJointAngularPosition(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    float invMassA = GetConstraintBodyInverseMass(world, 0, bodyA);
+    float invMassB = GetConstraintBodyInverseMass(world, 0, bodyB);
+    float totalInvMass = invMassA + invMassB;
+    if (totalInvMass <= 1e-8f) return;
+
+    Vec3 error = { 0.0f, 0.0f, 0.0f };
+    if (joint->type == PHYSICS_JOINT_FIXED) {
+        error = GetFixedJointAngularError(world, joint);
+    } else if (joint->type == PHYSICS_JOINT_HINGE) {
+        Vec3 axisA = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyA], joint->local_axis_a));
+        Vec3 axisB = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyB], joint->local_axis_b));
+        error = Vec3Cross(axisA, axisB);
+    }
+
+    Vec3 correction = Vec3Scale(error, 0.4f / totalInvMass);
+    ApplyBodyRotationCorrection(world, bodyA, Vec3Scale(correction, invMassA));
+    ApplyBodyRotationCorrection(world, bodyB, Vec3Scale(correction, -invMassB));
+}
+
+void SolveJointPositionConstraints(PhysicsWorld* world) {
+    if (!world || !world->joints || !world->bodies) return;
+
+    for (int i = 0; i < world->joints->count; i++) {
+        PhysicsJoint* joint = &world->joints->joints[i];
+        if (!IsValidBodyIndex(world, joint->bodyA_index) || !IsValidBodyIndex(world, joint->bodyB_index)) continue;
+
+        SolveJointAnchorPosition(world, joint);
+        SolveJointAngularPosition(world, joint);
+    }
+
+    SyncCollidersFromBodies(world);
 }
 
 void SolveVelocityConstraints(PhysicsWorld* world) {
@@ -1415,12 +2266,8 @@ void SolveVelocityConstraints(PhysicsWorld* world) {
         ContactConstraint* c = &world->constraints->constraints[i];
         
         // Get current body positions and velocities
-        Vec3 posA = (c->bodyA_type == 0) ? world->spheres->positions[c->bodyA_index] 
-                                        : (c->bodyA_type == 1) ? world->boxes->positions[c->bodyA_index]
-                                                               : c->contact_point;
-        Vec3 posB = (c->bodyB_type == 0) ? world->spheres->positions[c->bodyB_index] 
-                                        : (c->bodyB_type == 1) ? world->boxes->positions[c->bodyB_index]
-                                                               : c->contact_point;
+        Vec3 posA = (c->bodyA_type == 2 || c->bodyA_index < 0) ? c->contact_point : world->bodies->positions[c->bodyA_index];
+        Vec3 posB = (c->bodyB_type == 2 || c->bodyB_index < 0) ? c->contact_point : world->bodies->positions[c->bodyB_index];
         
         Vec3 rA = Vec3Sub(c->contact_point, posA);
         Vec3 rB = Vec3Sub(c->contact_point, posB);
@@ -1510,28 +2357,21 @@ void SolvePositionConstraints(PhysicsWorld* world) {
         float correctionAmount = (c->penetration - world->settings.allowed_penetration) * 0.8f;
         Vec3 correction = Vec3Scale(c->contact_normal, correctionAmount / totalInvMass);
         
-        // Apply position corrections directly
-        if (c->bodyA_type == 0 && invMassA > 0.0f) { // Sphere A
+        // Apply position corrections directly to rigid bodies
+        if (c->bodyA_type != 2 && c->bodyA_index >= 0 && invMassA > 0.0f) {
             Vec3 correctionA = Vec3Scale(correction, -invMassA);
-            world->spheres->positions[c->bodyA_index] = 
-                Vec3Add(world->spheres->positions[c->bodyA_index], correctionA);
-        } else if (c->bodyA_type == 1 && invMassA > 0.0f) { // Box A
-            Vec3 correctionA = Vec3Scale(correction, -invMassA);
-            world->boxes->positions[c->bodyA_index] = 
-                Vec3Add(world->boxes->positions[c->bodyA_index], correctionA);
+            world->bodies->positions[c->bodyA_index] =
+                Vec3Add(world->bodies->positions[c->bodyA_index], correctionA);
         }
         
-        if (c->bodyB_type == 0 && invMassB > 0.0f) { // Sphere B
+        if (c->bodyB_type != 2 && c->bodyB_index >= 0 && invMassB > 0.0f) {
             Vec3 correctionB = Vec3Scale(correction, invMassB);
-            world->spheres->positions[c->bodyB_index] = 
-                Vec3Add(world->spheres->positions[c->bodyB_index], correctionB);
-        } else if (c->bodyB_type == 1 && invMassB > 0.0f) { // Box B
-            Vec3 correctionB = Vec3Scale(correction, invMassB);
-            world->boxes->positions[c->bodyB_index] = 
-                Vec3Add(world->boxes->positions[c->bodyB_index], correctionB);
+            world->bodies->positions[c->bodyB_index] =
+                Vec3Add(world->bodies->positions[c->bodyB_index], correctionB);
         }
-        // SDF bodies (type 2) are static - no position correction needed
     }
+    
+    SyncCollidersFromBodies(world);
 }
 
 
@@ -1630,6 +2470,9 @@ PhysicsWorld* CreatePhysicsWorld(int max_spheres, int max_boxes, int max_collisi
     PhysicsWorld* world = (PhysicsWorld*)malloc(sizeof(PhysicsWorld));
     if (!world) return NULL;
     
+    int max_bodies = max_spheres + max_boxes;
+    if (max_bodies < 1) max_bodies = 1;
+    world->bodies = CreateRigidBodySystem(max_bodies);
     world->spheres = CreateSphereSystem(max_spheres);
     world->boxes = CreateBoxSystem(max_boxes);
     
@@ -1648,18 +2491,20 @@ PhysicsWorld* CreatePhysicsWorld(int max_spheres, int max_boxes, int max_collisi
     
     // Create constraint collection
     world->constraints = CreateConstraintCollection(max_collisions);
+    world->joints = CreateJointSystem(max_bodies);
     
     // Set default values
     world->gravity = (Vec3){ 0.0f, 0.0f, 0.0f }; // No gravity for now
     world->dt = 1.0f / 60.0f;
     world->usesSDF = false;
     world->SDFCollider = NULL;
+    world->SDFNormal = NULL;
     
     // Initialize physics settings with defaults
     ResetPhysicsSettingsToDefaults(world);
     
     // Check for allocation failures
-    if (!world->spheres || !world->boxes || !world->collisions || !world->collisions->contacts || !world->constraints) {
+    if (!world->bodies || !world->spheres || !world->boxes || !world->collisions || !world->collisions->contacts || !world->constraints || !world->joints) {
         DestroyPhysicsWorld(world);
         return NULL;
     }
@@ -1670,6 +2515,7 @@ PhysicsWorld* CreatePhysicsWorld(int max_spheres, int max_boxes, int max_collisi
 void DestroyPhysicsWorld(PhysicsWorld* world) {
     if (!world) return;
     
+    if (world->bodies) DestroyRigidBodySystem(world->bodies);
     if (world->spheres) DestroySphereSystem(world->spheres);
     if (world->boxes) DestroyBoxSystem(world->boxes);
     
@@ -1679,6 +2525,7 @@ void DestroyPhysicsWorld(PhysicsWorld* world) {
     }
     
     if (world->constraints) DestroyConstraintCollection(world->constraints);
+    if (world->joints) DestroyJointSystem(world->joints);
     
     
     free(world);
@@ -1692,9 +2539,15 @@ void UseSDF(PhysicsWorld* world, SDFFunction sdf_function) {
     world->usesSDF = (sdf_function != NULL);
 }
 
-// Update sleep states for all objects
-void UpdateSleepStates(PhysicsWorld* world) {
+void UseSDFNormal(PhysicsWorld* world, SDFNormalFunction sdf_normal_function) {
     if (!world) return;
+    
+    world->SDFNormal = sdf_normal_function;
+}
+
+// Update sleep states for all rigid bodies
+void UpdateSleepStates(PhysicsWorld* world) {
+    if (!world || !world->bodies) return;
     
     float dt = world->dt;
     float linear_threshold = world->settings.sleep_linear_threshold;
@@ -1710,77 +2563,30 @@ void UpdateSleepStates(PhysicsWorld* world) {
         debug_timer = 0.0f;
     }
     
-    // Update sphere sleep states
-    for (int i = 0; i < world->spheres->count; i++) {
-        // Skip static objects - they don't need sleep
-        if (world->spheres->is_static[i]) continue;
+    for (int i = 0; i < world->bodies->count; i++) {
+        if (world->bodies->is_static[i]) continue;
         
-        // Calculate kinetic energy
-        Vec3 velocity = world->spheres->velocities[i];
-        Vec3 angular_velocity = world->spheres->angular_velocities[i];
+        Vec3 velocity = world->bodies->velocities[i];
+        Vec3 angular_velocity = world->bodies->angular_velocities[i];
         float linear_speed = Vec3Length(velocity);
         float angular_speed = Vec3Length(angular_velocity);
-        
-        // Check if object is below sleep thresholds
         bool low_energy = (linear_speed < linear_threshold && angular_speed < angular_threshold);
         
         if (low_energy) {
-            // Accumulate sleep time
-            world->spheres->sleep_timers[i] += dt;
+            world->bodies->sleep_timers[i] += dt;
             
-            // Put to sleep if timer exceeds threshold
-            if (world->spheres->sleep_timers[i] >= time_required && !world->spheres->is_sleeping[i]) {
-                world->spheres->is_sleeping[i] = true;
-                world->spheres->velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
-                world->spheres->angular_velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+            if (world->bodies->sleep_timers[i] >= time_required && !world->bodies->is_sleeping[i]) {
+                world->bodies->is_sleeping[i] = true;
+                world->bodies->velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+                world->bodies->angular_velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
             }
         } else {
-            // Reset sleep timer and wake up if sleeping
-            world->spheres->sleep_timers[i] = 0.0f;
-            world->spheres->is_sleeping[i] = false;
+            world->bodies->sleep_timers[i] = 0.0f;
+            world->bodies->is_sleeping[i] = false;
         }
     }
     
-    // Update box sleep states
-    for (int i = 0; i < world->boxes->count; i++) {
-        // Skip static objects - they don't need sleep
-        if (world->boxes->is_static[i]) continue;
-        
-        // Calculate kinetic energy
-        Vec3 velocity = world->boxes->velocities[i];
-        Vec3 angular_velocity = world->boxes->angular_velocities[i];
-        float linear_speed = Vec3Length(velocity);
-        float angular_speed = Vec3Length(angular_velocity);
-        
-        // Check if object is below sleep thresholds
-        bool low_energy = (linear_speed < linear_threshold && angular_speed < angular_threshold);
-        
-        // Debug output for first box
-        //if (i == 0) {
-        //    printf("Box[0]: linear_speed=%.6f, angular_speed=%.6f, low_energy=%d, sleep_timer=%.3f, is_sleeping=%d\n", 
-        //           linear_speed, angular_speed, low_energy, world->boxes->sleep_timers[i], world->boxes->is_sleeping[i]);
-        //}
-        
-        if (low_energy) {
-            // Accumulate sleep time
-            world->boxes->sleep_timers[i] += dt;
-            
-            // Put to sleep if timer exceeds threshold
-            if (world->boxes->sleep_timers[i] >= time_required && !world->boxes->is_sleeping[i]) {
-                //printf("BOX[%d] GOING TO SLEEP! timer=%.3f\n", i, world->boxes->sleep_timers[i]);
-                world->boxes->is_sleeping[i] = true;
-                world->boxes->velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
-                world->boxes->angular_velocities[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
-            }
-        } else {
-            // Reset sleep timer and wake up if sleeping
-            world->boxes->sleep_timers[i] = 0.0f;
-            if (world->boxes->is_sleeping[i]) {
-                //printf("BOX[%d] WAKING UP! linear_speed=%.6f, angular_speed=%.6f\n", i, linear_speed, angular_speed);
-            }
-            world->boxes->is_sleeping[i] = false;
-        }
-    }
+    SyncCollidersFromBodies(world);
 }
 
 // Main physics simulation step - CORRECT Box2D pipeline order
@@ -1793,9 +2599,13 @@ void PhysicsStep(PhysicsWorld* world, float deltaTime) {
     }
     
     world->dt = deltaTime;
+    SyncCollidersFromBodies(world);
     
     // 1. Apply Forces
     ApplyForces(world);
+
+    // 1b. Apply soft spring joint forces
+    ApplySpringJointForces(world);
     
     // 2. Integrate Velocities ONLY (not positions yet!)
     IntegrateVelocities(world);
@@ -1808,6 +2618,9 @@ void PhysicsStep(PhysicsWorld* world, float deltaTime) {
     
     // 5. Integrate Positions (after constraint solving)
     IntegratePositions(world);
+
+    // 5b. Joint position stabilization
+    SolveJointPositionConstraints(world);
     
     // 6. Update sleep states
     UpdateSleepStates(world);
@@ -1818,28 +2631,54 @@ void PhysicsStep(PhysicsWorld* world, float deltaTime) {
 
 // Physics sub-systems implementation
 void ApplyForces(PhysicsWorld* world) {
-    if (!world) return;
+    if (!world || !world->bodies) return;
     
-    // Apply gravity to all dynamic spheres
-    for (int i = 0; i < world->spheres->count; i++) {
-        if (world->spheres->is_static[i]) continue;  // Skip static objects
-        Vec3 gravityForce = Vec3Scale(world->gravity, world->spheres->masses[i]);
-        world->spheres->forces[i] = Vec3Add(world->spheres->forces[i], gravityForce);
+    for (int i = 0; i < world->bodies->count; i++) {
+        if (world->bodies->is_static[i]) continue;
+        Vec3 gravityForce = Vec3Scale(world->gravity, world->bodies->masses[i]);
+        world->bodies->forces[i] = Vec3Add(world->bodies->forces[i], gravityForce);
     }
-    
-    // Apply gravity to all dynamic boxes
-    for (int i = 0; i < world->boxes->count; i++) {
-        if (world->boxes->is_static[i]) continue;  // Skip static objects
-        Vec3 gravityForce = Vec3Scale(world->gravity, world->boxes->masses[i]);
-        world->boxes->forces[i] = Vec3Add(world->boxes->forces[i], gravityForce);
-    }
-    
-    // User forces are already added via AddSphereForce/AddBoxForce calls
 }
 
 // BOX2D PIPELINE: Integrate velocities first, positions later after constraint solving
 void IntegrateVelocities(PhysicsWorld* world) {
     if (!world) return;
+    if (world->bodies) {
+        float dt = world->dt;
+        
+        for (int i = 0; i < world->bodies->count; i++) {
+            if (world->bodies->is_static[i] || world->bodies->is_sleeping[i]) continue;
+            
+            Vec3 acceleration = Vec3Scale(world->bodies->forces[i], 1.0f / world->bodies->masses[i]);
+            world->bodies->velocities[i] = Vec3Add(world->bodies->velocities[i], Vec3Scale(acceleration, dt));
+            
+            Quat rotation = world->bodies->rotations[i];
+            Vec3 localTorque = QuatRotateVec3(QuatConjugate(rotation), world->bodies->torques[i]);
+            Vec3 inertia = world->bodies->inertias[i];
+            float min_inertia = 1e-6f;
+            Vec3 localAngularAcceleration = {
+                (inertia.x > min_inertia) ? localTorque.x / inertia.x : 0.0f,
+                (inertia.y > min_inertia) ? localTorque.y / inertia.y : 0.0f,
+                (inertia.z > min_inertia) ? localTorque.z / inertia.z : 0.0f
+            };
+            Vec3 angularAcceleration = QuatRotateVec3(rotation, localAngularAcceleration);
+            world->bodies->angular_velocities[i] = Vec3Add(world->bodies->angular_velocities[i], Vec3Scale(angularAcceleration, dt));
+        }
+        
+        float linear_damping = world->settings.linear_damping;
+        float angular_damping = world->settings.angular_damping;
+        
+        for (int i = 0; i < world->bodies->count; i++) {
+            if (world->bodies->is_static[i] || world->bodies->is_sleeping[i]) continue;
+            world->bodies->velocities[i] = Vec3Scale(world->bodies->velocities[i], linear_damping);
+            world->bodies->angular_velocities[i] = Vec3Scale(world->bodies->angular_velocities[i], angular_damping);
+            world->bodies->forces[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+            world->bodies->torques[i] = (Vec3){ 0.0f, 0.0f, 0.0f };
+        }
+        
+        SyncCollidersFromBodies(world);
+        return;
+    }
     
     float dt = world->dt;
     
@@ -1927,6 +2766,33 @@ void IntegrateVelocities(PhysicsWorld* world) {
 // BOX2D PIPELINE: Integrate positions after constraint solving
 void IntegratePositions(PhysicsWorld* world) {
     if (!world) return;
+    if (world->bodies) {
+        float dt = world->dt;
+        
+        for (int i = 0; i < world->bodies->count; i++) {
+            if (world->bodies->is_static[i] || world->bodies->is_sleeping[i]) continue;
+            
+            world->bodies->positions[i] = Vec3Add(world->bodies->positions[i], Vec3Scale(world->bodies->velocities[i], dt));
+            
+            Vec3 omega = world->bodies->angular_velocities[i];
+            Quat omega_quat = { omega.x, omega.y, omega.z, 0.0f };
+            Quat current_rotation = world->bodies->rotations[i];
+            Quat q_dot = QuatMultiply(omega_quat, current_rotation);
+            q_dot.x *= 0.5f;
+            q_dot.y *= 0.5f;
+            q_dot.z *= 0.5f;
+            q_dot.w *= 0.5f;
+            
+            world->bodies->rotations[i].x = current_rotation.x + q_dot.x * dt;
+            world->bodies->rotations[i].y = current_rotation.y + q_dot.y * dt;
+            world->bodies->rotations[i].z = current_rotation.z + q_dot.z * dt;
+            world->bodies->rotations[i].w = current_rotation.w + q_dot.w * dt;
+            world->bodies->rotations[i] = QuatNormalize(world->bodies->rotations[i]);
+        }
+        
+        SyncCollidersFromBodies(world);
+        return;
+    }
     
     float dt = world->dt;
     
@@ -1986,14 +2852,15 @@ void CollectCollisions(PhysicsWorld* world) {
     for (int i = 0; i < world->spheres->count; i++) {
         for (int j = i + 1; j < world->spheres->count; j++) {
             if (world->collisions->count >= world->collisions->capacity) break;
+            if (world->spheres->body_indices[i] == world->spheres->body_indices[j]) continue;
             
             CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
             if (CheckSphereCollisionWithData(
                 world->spheres->positions[i], world->spheres->radii[i],
                 world->spheres->positions[j], world->spheres->radii[j], contact)) {
                 
-                contact->bodyA_type = 0; contact->bodyA_index = i;
-                contact->bodyB_type = 0; contact->bodyB_index = j;
+                contact->bodyA_type = 0; contact->bodyA_index = world->spheres->body_indices[i]; contact->colliderA_index = i;
+                contact->bodyB_type = 0; contact->bodyB_index = world->spheres->body_indices[j]; contact->colliderB_index = j;
                 world->collisions->count++;
                 
                 // Fire callbacks for sphere-sphere collision
@@ -2010,6 +2877,7 @@ void CollectCollisions(PhysicsWorld* world) {
     // Box-Box collisions using contact manifolds (A=first box, B=second box)
     for (int i = 0; i < world->boxes->count; i++) {
         for (int j = i + 1; j < world->boxes->count; j++) {
+            if (world->boxes->body_indices[i] == world->boxes->body_indices[j]) continue;
             // Generate contact manifold for this box pair
             ContactManifold manifold;
             GenerateBoxBoxManifold(world, i, j, &manifold);
@@ -2022,8 +2890,10 @@ void CollectCollisions(PhysicsWorld* world) {
                     CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
                     contact->bodyA_type = manifold.bodyA_type;
                     contact->bodyA_index = manifold.bodyA_index;
+                    contact->colliderA_index = manifold.colliderA_index;
                     contact->bodyB_type = manifold.bodyB_type;
                     contact->bodyB_index = manifold.bodyB_index;
+                    contact->colliderB_index = manifold.colliderB_index;
                     contact->contact_point = manifold.points[k];
                     contact->contact_normal = manifold.normal;  // Consistent normal
                     contact->penetration = manifold.penetrations[k];
@@ -2050,14 +2920,15 @@ void CollectCollisions(PhysicsWorld* world) {
     for (int i = 0; i < world->spheres->count; i++) {
         for (int j = 0; j < world->boxes->count; j++) {
             if (world->collisions->count >= world->collisions->capacity) break;
+            if (world->spheres->body_indices[i] == world->boxes->body_indices[j]) continue;
             
             CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
             if (CheckSphereBoxCollisionWithData(
                 world->spheres->positions[i], world->spheres->radii[i],
                 world->boxes->positions[j], world->boxes->sizes[j], world->boxes->rotations[j], contact)) {
                 
-                contact->bodyA_type = 0; contact->bodyA_index = i;  // A = sphere
-                contact->bodyB_type = 1; contact->bodyB_index = j;  // B = box
+                contact->bodyA_type = 0; contact->bodyA_index = world->spheres->body_indices[i]; contact->colliderA_index = i;  // A = sphere
+                contact->bodyB_type = 1; contact->bodyB_index = world->boxes->body_indices[j]; contact->colliderB_index = j;  // B = box
                 world->collisions->count++;
                 
                 // Fire callbacks for sphere-box collision
@@ -2093,8 +2964,8 @@ void CollectCollisions(PhysicsWorld* world) {
                 contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f); // Negate to point from sphere to surface
                 contact->contact_point = Vec3Sub(sphere_center, Vec3Scale(contact->contact_normal, sphere_radius));
                 
-                contact->bodyA_type = 0; contact->bodyA_index = i;  // A = sphere
-                contact->bodyB_type = 2; contact->bodyB_index = 0; // B = SDF (type 2, index 0)
+                contact->bodyA_type = 0; contact->bodyA_index = world->spheres->body_indices[i]; contact->colliderA_index = i;  // A = sphere
+                contact->bodyB_type = 2; contact->bodyB_index = -1; contact->colliderB_index = -1; // B = SDF
                 world->collisions->count++;
                 
                 // Fire callback for sphere-SDF collision
@@ -2120,6 +2991,10 @@ void CollectCollisions(PhysicsWorld* world) {
 
 // Get velocity at a point on a body (v + ω × r)
 Vec3 GetBodyVelocityAtPoint(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 point) {
+    if (world && world->bodies) {
+        return GetConstraintBodyVelocityAtPoint(world, bodyType, bodyIndex, point);
+    }
+    
     Vec3 bodyPos, bodyVel, bodyAngVel;
     //float bodyAngVelLen = Vec3Length(bodyAngVel);
     //if( bodyAngVelLen*bodyAngVelLen < 1e-10f) {  // Make a helper function for square of vec.
@@ -2150,6 +3025,12 @@ Vec3 GetBodyVelocityAtPoint(PhysicsWorld* world, int bodyType, int bodyIndex, Ve
 
 // Calculate effective mass for impulse resolution
 float CalculateEffectiveMass(PhysicsWorld* world, CollisionContact* contact) {
+    if (world && world->bodies) {
+        float inv_m1 = GetConstraintBodyInverseMass(world, contact->bodyA_type, contact->bodyA_index);
+        float inv_m2 = GetConstraintBodyInverseMass(world, contact->bodyB_type, contact->bodyB_index);
+        return (inv_m1 + inv_m2 > 0.0f) ? 1.0f / (inv_m1 + inv_m2) : 0.0f;
+    }
+    
     Vec3 n = contact->contact_normal;
     Vec3 r1 = Vec3Sub(contact->contact_point, 
                      (contact->bodyA_type == 0) ? world->spheres->positions[contact->bodyA_index] 
@@ -2233,6 +3114,14 @@ float CalculateEffectiveMass(PhysicsWorld* world, CollisionContact* contact) {
 
 // Apply impulse to a body (both linear and angular components)
 void ApplyImpulse(PhysicsWorld* world, int bodyType, int bodyIndex, Vec3 impulse, Vec3 contactPoint) {
+    if (world && world->bodies) {
+        Vec3 bodyPos = (bodyType == 2 || bodyIndex < 0) ? contactPoint : world->bodies->positions[bodyIndex];
+        Vec3 r = Vec3Sub(contactPoint, bodyPos);
+        ApplyConstraintImpulse(world, bodyType, bodyIndex, impulse, Vec3Cross(r, impulse));
+        SyncCollidersFromBodies(world);
+        return;
+    }
+    
     if (bodyType == 0) { // Sphere
         // Skip static objects
         if (world->spheres->is_static[bodyIndex]) return;
@@ -2316,6 +3205,13 @@ void CleanupPhysics(PhysicsWorld* world) {
 
 // Estimate normal at a point using finite differences
 Vec3 SDF_EstimateNormal(PhysicsWorld* world, Vec3 point) {
+    if (world->SDFNormal) {
+        Vec3 normal = Vec3Normalize(world->SDFNormal(point));
+        if (Vec3Length(normal) > world->settings.vector_normalize_epsilon) {
+            return normal;
+        }
+    }
+
     float epsilon = world->settings.sdf_normal_epsilon;
     Vec3 eps_x = { epsilon, 0.0f, 0.0f };
     Vec3 eps_y = { 0.0f, epsilon, 0.0f };
@@ -2330,83 +3226,256 @@ Vec3 SDF_EstimateNormal(PhysicsWorld* world, Vec3 point) {
     return Vec3Normalize(normal);
 }
 
-// Box-SDF collision detection using 3-stage approach
-bool CheckBoxSDFCollision(PhysicsWorld* world, Vec3 boxPos, Vec3 boxSize, Quat boxRot, CollisionContact* contact) {
-    // Stage 1: Circumscribed sphere test
-    // Calculate radius of circumscribed sphere (distance from center to farthest corner)
-    float circumscribed_radius = Vec3Length(boxSize);
+typedef struct {
+    Vec3 point;
+    float value;
+    float penetration;
+} SDFContactCandidate;
+
+static int ClampPhysicsInt(int value, int min_value, int max_value) {
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static int BuildBoxSDFTraceSamples(Vec3 boxPos, Vec3 boxSize, Quat boxRot, 
+                                   PhysicsSDFBoxTraceSamples sample_mode, Vec3* samples, int max_samples) {
+    Vec3 axes[3] = {
+        QuatRotateVec3(boxRot, (Vec3){1.0f, 0.0f, 0.0f}),
+        QuatRotateVec3(boxRot, (Vec3){0.0f, 1.0f, 0.0f}),
+        QuatRotateVec3(boxRot, (Vec3){0.0f, 0.0f, 1.0f})
+    };
+    float extents[3] = { boxSize.x, boxSize.y, boxSize.z };
+    int count = 0;
     
-    // Evaluate SDF at box center
-    float center_distance = world->SDFCollider(boxPos);
+    for (int ix = -1; ix <= 1; ix++) {
+        for (int iy = -1; iy <= 1; iy++) {
+            for (int iz = -1; iz <= 1; iz++) {
+                int non_zero_axes = (ix != 0) + (iy != 0) + (iz != 0);
+                if (non_zero_axes == 0) continue;
+                if (sample_mode == PHYSICS_SDF_BOX_TRACE_CORNERS && non_zero_axes != 3) continue;
+                if (sample_mode == PHYSICS_SDF_BOX_TRACE_CORNERS_AND_FACES && non_zero_axes == 2) continue;
+                if (count >= max_samples) return count;
+                
+                Vec3 p = boxPos;
+                p = Vec3Add(p, Vec3Scale(axes[0], (float)ix * extents[0]));
+                p = Vec3Add(p, Vec3Scale(axes[1], (float)iy * extents[1]));
+                p = Vec3Add(p, Vec3Scale(axes[2], (float)iz * extents[2]));
+                samples[count++] = p;
+            }
+        }
+    }
     
-    // If SDF distance > circumscribed radius, no collision possible
-    if (center_distance > circumscribed_radius) {
+    return count;
+}
+
+static bool IsDuplicateSDFContact(SDFContactCandidate* candidates, int candidate_count, Vec3 point, float min_separation) {
+    float min_separation_sq = min_separation * min_separation;
+    for (int i = 0; i < candidate_count; i++) {
+        Vec3 delta = Vec3Sub(candidates[i].point, point);
+        if (Vec3Dot(delta, delta) <= min_separation_sq) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void InsertSDFContactCandidate(SDFContactCandidate* candidates, int* candidate_count, int max_candidates,
+                                      Vec3 point, float value, float penetration, float min_separation) {
+    if (!candidates || !candidate_count || max_candidates <= 0 || penetration <= 0.0f) return;
+    if (IsDuplicateSDFContact(candidates, *candidate_count, point, min_separation)) return;
+    
+    int insert_index = *candidate_count;
+    if (*candidate_count < max_candidates) {
+        (*candidate_count)++;
+    } else if (penetration > candidates[max_candidates - 1].penetration) {
+        insert_index = max_candidates - 1;
+    } else {
+        return;
+    }
+    
+    while (insert_index > 0 && candidates[insert_index - 1].penetration < penetration) {
+        if (insert_index < max_candidates) {
+            candidates[insert_index] = candidates[insert_index - 1];
+        }
+        insert_index--;
+    }
+    
+    candidates[insert_index].point = point;
+    candidates[insert_index].value = value;
+    candidates[insert_index].penetration = penetration;
+}
+
+static Vec3 RefineSDFSignCrossing(PhysicsWorld* world, Vec3 a, Vec3 b, float value_a, int refine_steps) {
+    Vec3 low = a;
+    Vec3 high = b;
+    float low_value = value_a;
+    
+    for (int i = 0; i < refine_steps; i++) {
+        Vec3 mid = Vec3Scale(Vec3Add(low, high), 0.5f);
+        float mid_value = world->SDFCollider(mid);
+        
+        if ((low_value <= 0.0f && mid_value <= 0.0f) || (low_value >= 0.0f && mid_value >= 0.0f)) {
+            low = mid;
+            low_value = mid_value;
+        } else {
+            high = mid;
+        }
+    }
+    
+    return Vec3Scale(Vec3Add(low, high), 0.5f);
+}
+
+static bool TraceSDFSurfaceOnSegment(PhysicsWorld* world, Vec3 start, float start_value, Vec3 end,
+                                     SDFContactCandidate* out_candidate) {
+    int trace_steps = ClampPhysicsInt(world->settings.sdf_box_trace_steps, 1, 128);
+    int refine_steps = ClampPhysicsInt(world->settings.sdf_box_trace_refine_steps, 0, 32);
+    float surface_epsilon = fmaxf(world->settings.sdf_box_surface_epsilon, 0.0f);
+    float contact_margin = fmaxf(surface_epsilon, world->settings.allowed_penetration);
+    
+    Vec3 segment = Vec3Sub(end, start);
+    Vec3 previous_point = start;
+    float previous_value = start_value;
+    Vec3 best_point = start;
+    float best_value = start_value;
+    float best_abs_value = fabsf(start_value);
+    bool found_sign_crossing = false;
+    
+    for (int step = 1; step <= trace_steps; step++) {
+        float t = (float)step / (float)trace_steps;
+        Vec3 p = Vec3Add(start, Vec3Scale(segment, t));
+        float value = world->SDFCollider(p);
+        float abs_value = fabsf(value);
+        
+        if (abs_value < best_abs_value) {
+            best_abs_value = abs_value;
+            best_value = value;
+            best_point = p;
+        }
+        
+        if ((previous_value <= 0.0f && value >= 0.0f) || (previous_value >= 0.0f && value <= 0.0f)) {
+            if (fabsf(previous_value - value) > world->settings.collision_epsilon) {
+                best_point = RefineSDFSignCrossing(world, previous_point, p, previous_value, refine_steps);
+                best_value = world->SDFCollider(best_point);
+                best_abs_value = fabsf(best_value);
+                found_sign_crossing = true;
+                break;
+            }
+        }
+        
+        previous_point = p;
+        previous_value = value;
+    }
+    
+    if (!found_sign_crossing && best_value > surface_epsilon && best_abs_value > surface_epsilon) {
         return false;
     }
     
-    // Stage 2: Vertex test - check all 8 vertices of the box
-    Vec3 vertices[8];
-    OBB box_obb = CreateOBB(boxPos, boxSize, boxRot);
-    GetOBBVertices(&box_obb, vertices);
-    
-    float deepest_penetration = -999999.0f;
-    Vec3 deepest_point = { 0.0f, 0.0f, 0.0f };
-    bool collision_found = false;
-    
-    for (int i = 0; i < 8; i++) {
-        float vertex_distance = world->SDFCollider(vertices[i]);
-        
-        // If vertex is inside SDF (distance < 0), we have collision
-        if (vertex_distance < 0.0f) {
-            collision_found = true;
-            float penetration = -vertex_distance;
-            
-            if (penetration > deepest_penetration) {
-                deepest_penetration = penetration;
-                deepest_point = vertices[i];
-            }
+    if (out_candidate) {
+        out_candidate->point = best_point;
+        out_candidate->value = best_value;
+        out_candidate->penetration = contact_margin - fminf(best_value, best_abs_value);
+        if (out_candidate->penetration <= 0.0f) {
+            out_candidate->penetration = contact_margin;
         }
     }
     
-    // Stage 3: Face center test - check center of each face (check both vertices AND face centers)
-    Vec3 face_centers[6];
+    return true;
+}
+
+static int FindBoxSDFSurfaceTraceContacts(PhysicsWorld* world, Vec3 boxPos, Vec3 boxSize, Quat boxRot,
+                                          SDFContactCandidate* candidates, int max_candidates) {
+    if (!world || !world->SDFCollider || !candidates || max_candidates <= 0) return 0;
     
-    // Calculate face centers: box center + (half_extent * face_normal)
-    Vec3 x_axis = QuatRotateVec3(boxRot, (Vec3){1.0f, 0.0f, 0.0f});
-    Vec3 y_axis = QuatRotateVec3(boxRot, (Vec3){0.0f, 1.0f, 0.0f});
-    Vec3 z_axis = QuatRotateVec3(boxRot, (Vec3){0.0f, 0.0f, 1.0f});
+    Vec3 sample_points[26];
+    PhysicsSDFBoxTraceSamples sample_mode = world->settings.sdf_box_trace_samples;
+    if (sample_mode < PHYSICS_SDF_BOX_TRACE_CORNERS || sample_mode > PHYSICS_SDF_BOX_TRACE_FULL) {
+        sample_mode = PHYSICS_SDF_BOX_TRACE_CORNERS;
+    }
     
-    face_centers[0] = Vec3Add(boxPos, Vec3Scale(x_axis, boxSize.x));   // +X face
-    face_centers[1] = Vec3Sub(boxPos, Vec3Scale(x_axis, boxSize.x));   // -X face
-    face_centers[2] = Vec3Add(boxPos, Vec3Scale(y_axis, boxSize.y));   // +Y face
-    face_centers[3] = Vec3Sub(boxPos, Vec3Scale(y_axis, boxSize.y));   // -Y face
-    face_centers[4] = Vec3Add(boxPos, Vec3Scale(z_axis, boxSize.z));   // +Z face
-    face_centers[5] = Vec3Sub(boxPos, Vec3Scale(z_axis, boxSize.z));   // -Z face
+    int sample_count = BuildBoxSDFTraceSamples(boxPos, boxSize, boxRot, sample_mode, sample_points, 26);
+    float center_value = world->SDFCollider(boxPos);
+    float surface_epsilon = fmaxf(world->settings.sdf_box_surface_epsilon, 0.0f);
+    float contact_margin = fmaxf(surface_epsilon, world->settings.allowed_penetration);
+    float min_separation = fmaxf(contact_margin * 0.5f, world->settings.collision_epsilon);
+    int candidate_count = 0;
     
-    for (int i = 0; i < 6; i++) {
-        float face_distance = world->SDFCollider(face_centers[i]);
+    for (int i = 0; i < sample_count; i++) {
+        SDFContactCandidate candidate;
+        if (!TraceSDFSurfaceOnSegment(world, boxPos, center_value, sample_points[i], &candidate)) {
+            continue;
+        }
         
-        // If face center is inside SDF (distance < 0), we have collision
-        if (face_distance < 0.0f) {
-            float penetration = -face_distance;
-            
-            if (penetration > deepest_penetration) {
-                deepest_penetration = penetration;
-                deepest_point = face_centers[i];
-            }
-            collision_found = true; // Mark as collision found
+        InsertSDFContactCandidate(candidates, &candidate_count, max_candidates,
+                                  candidate.point, candidate.value, candidate.penetration, min_separation);
+    }
+    
+    return candidate_count;
+}
+
+static int FindBoxSDFSignedDistanceContacts(PhysicsWorld* world, Vec3 boxPos, Vec3 boxSize, Quat boxRot,
+                                            SDFContactCandidate* candidates, int max_candidates) {
+    if (!world || !world->SDFCollider || !candidates || max_candidates <= 0) return 0;
+    
+    float circumscribed_radius = Vec3Length(boxSize);
+    float center_distance = world->SDFCollider(boxPos);
+    
+    if (center_distance > circumscribed_radius) {
+        return 0;
+    }
+    
+    Vec3 sample_points[26];
+    int sample_count = BuildBoxSDFTraceSamples(boxPos, boxSize, boxRot, PHYSICS_SDF_BOX_TRACE_FULL, sample_points, 26);
+    float contact_threshold = -fmaxf(world->settings.collision_epsilon, 0.001f);
+    float min_separation = fmaxf(world->settings.allowed_penetration * 0.5f, world->settings.collision_epsilon);
+    int candidate_count = 0;
+    
+    for (int i = 0; i < sample_count; i++) {
+        float value = world->SDFCollider(sample_points[i]);
+        if (value < contact_threshold) {
+            InsertSDFContactCandidate(candidates, &candidate_count, max_candidates,
+                                      sample_points[i], value, -value, min_separation);
         }
     }
     
-    if (collision_found && contact) {
-        contact->penetration = deepest_penetration;
-        Vec3 sdf_gradient = SDF_EstimateNormal(world, deepest_point);
-        contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f); // Negate to point from box to surface
-        contact->contact_point = deepest_point;
-        return true;
+    return candidate_count;
+}
+
+static Vec3 GetBoxSDFContactNormal(PhysicsWorld* world, Vec3 boxPos, Vec3 contactPoint) {
+    Vec3 sdf_gradient = SDF_EstimateNormal(world, contactPoint);
+    Vec3 normal = Vec3Scale(sdf_gradient, -1.0f);
+    Vec3 center_to_contact = Vec3Sub(contactPoint, boxPos);
+    
+    if (Vec3Dot(normal, center_to_contact) < 0.0f) {
+        normal = Vec3Scale(normal, -1.0f);
     }
     
-    return false;
+    return normal;
+}
+
+// Box-SDF collision detection using either signed-distance sampling or surface tracing
+bool CheckBoxSDFCollision(PhysicsWorld* world, Vec3 boxPos, Vec3 boxSize, Quat boxRot, CollisionContact* contact) {
+    if (!world || !world->SDFCollider) return false;
+    
+    SDFContactCandidate candidates[26];
+    int max_contacts = ClampPhysicsInt(world->settings.sdf_box_max_contacts, 1, 26);
+    int candidate_count = 0;
+    
+    if (world->settings.sdf_box_collision_mode == PHYSICS_SDF_BOX_SIGNED_DISTANCE) {
+        candidate_count = FindBoxSDFSignedDistanceContacts(world, boxPos, boxSize, boxRot, candidates, max_contacts);
+    } else {
+        candidate_count = FindBoxSDFSurfaceTraceContacts(world, boxPos, boxSize, boxRot, candidates, max_contacts);
+    }
+    
+    if (candidate_count <= 0) return false;
+    
+    if (contact) {
+        contact->penetration = candidates[0].penetration;
+        contact->contact_normal = GetBoxSDFContactNormal(world, boxPos, candidates[0].point);
+        contact->contact_point = candidates[0].point;
+    }
+    
+    return true;
 }
 
 // Generate multiple contact points for box-SDF collision (for stable stacking)
@@ -2418,61 +3487,26 @@ void GenerateBoxSDFContacts(PhysicsWorld* world, int boxIndex) {
     Vec3 boxSize = world->boxes->sizes[boxIndex];
     Quat boxRot = world->boxes->rotations[boxIndex];
     
-    // Get all 8 vertices of the box
-    Vec3 vertices[8];
-    OBB box_obb = CreateOBB(boxPos, boxSize, boxRot);
-    GetOBBVertices(&box_obb, vertices);
+    SDFContactCandidate candidates[26];
+    int max_contacts = ClampPhysicsInt(world->settings.sdf_box_max_contacts, 1, 26);
+    int candidate_count = 0;
     
-    // Check each vertex for SDF collision
-    for (int i = 0; i < 8; i++) {
-        if (world->collisions->count >= world->collisions->capacity) break;
-        
-        float vertex_distance = world->SDFCollider(vertices[i]);
-        
-        // If vertex is inside SDF (distance < 0), generate contact
-        if (vertex_distance < -0.001f) { // Small threshold to avoid micro-contacts
-            CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
-            
-            contact->penetration = -vertex_distance;
-            Vec3 sdf_gradient = SDF_EstimateNormal(world, vertices[i]);
-            contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f); // Normal points from box to SDF
-            contact->contact_point = vertices[i];
-            
-            contact->bodyA_type = 1; contact->bodyA_index = boxIndex;  // A = box
-            contact->bodyB_type = 2; contact->bodyB_index = 0;        // B = SDF
-            
-            world->collisions->count++;
-        }
+    if (world->settings.sdf_box_collision_mode == PHYSICS_SDF_BOX_SIGNED_DISTANCE) {
+        candidate_count = FindBoxSDFSignedDistanceContacts(world, boxPos, boxSize, boxRot, candidates, max_contacts);
+    } else {
+        candidate_count = FindBoxSDFSurfaceTraceContacts(world, boxPos, boxSize, boxRot, candidates, max_contacts);
     }
     
-    // Also check edge midpoints for better contact coverage
-    // Generate contacts at the midpoint of each edge touching the ground
-    for (int edge = 0; edge < 12; edge++) {
+    for (int i = 0; i < candidate_count; i++) {
         if (world->collisions->count >= world->collisions->capacity) break;
         
-        // Box edge pairs (vertex indices for each of the 12 edges)
-        int edgePairs[12][2] = {
-            {0,1}, {1,2}, {2,3}, {3,0}, // Bottom face edges
-            {4,5}, {5,6}, {6,7}, {7,4}, // Top face edges  
-            {0,4}, {1,5}, {2,6}, {3,7}  // Vertical edges
-        };
-        
-        Vec3 edgeMidpoint = Vec3Scale(Vec3Add(vertices[edgePairs[edge][0]], vertices[edgePairs[edge][1]]), 0.5f);
-        float edge_distance = world->SDFCollider(edgeMidpoint);
-        
-        if (edge_distance < -0.001f) { // Edge is inside SDF
-            CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
-            
-            contact->penetration = -edge_distance;
-            Vec3 sdf_gradient = SDF_EstimateNormal(world, edgeMidpoint);
-            contact->contact_normal = Vec3Scale(sdf_gradient, -1.0f);
-            contact->contact_point = edgeMidpoint;
-            
-            contact->bodyA_type = 1; contact->bodyA_index = boxIndex;
-            contact->bodyB_type = 2; contact->bodyB_index = 0;
-            
-            world->collisions->count++;
-        }
+        CollisionContact* contact = &world->collisions->contacts[world->collisions->count];
+        contact->penetration = candidates[i].penetration;
+        contact->contact_normal = GetBoxSDFContactNormal(world, boxPos, candidates[i].point);
+        contact->contact_point = candidates[i].point;
+        contact->bodyA_type = 1; contact->bodyA_index = world->boxes->body_indices[boxIndex]; contact->colliderA_index = boxIndex;
+        contact->bodyB_type = 2; contact->bodyB_index = -1; contact->colliderB_index = -1;
+        world->collisions->count++;
     }
 }
 
@@ -2506,6 +3540,15 @@ void ResetPhysicsSettingsToDefaults(PhysicsWorld* world) {
     world->settings.manifold_contact_tolerance = 0.01f;
     world->settings.manifold_penetration_tolerance = -0.5f;  // Very permissive for touching
     world->settings.manifold_max_contacts = 8;                // More contacts for stability
+
+    // Box-SDF collision settings. Surface trace handles implicit or unsigned
+    // fields while keeping the default to 8 center-to-corner rays.
+    world->settings.sdf_box_collision_mode = PHYSICS_SDF_BOX_SURFACE_TRACE;
+    world->settings.sdf_box_trace_samples = PHYSICS_SDF_BOX_TRACE_CORNERS;
+    world->settings.sdf_box_trace_steps = 6;
+    world->settings.sdf_box_trace_refine_steps = 4;
+    world->settings.sdf_box_surface_epsilon = 0.05f;
+    world->settings.sdf_box_max_contacts = 4;
     
     // Numerical tolerances (rarely changed)
     world->settings.collision_epsilon = 1e-6f;
@@ -2543,6 +3586,27 @@ void SetManifoldSettings(PhysicsWorld* world, float contact_tolerance, float pen
     world->settings.manifold_max_contacts = (max_contacts > MAX_MANIFOLD_CONTACTS) ? MAX_MANIFOLD_CONTACTS : max_contacts;
 }
 
+void SetSDFBoxCollisionMode(PhysicsWorld* world, PhysicsSDFBoxCollisionMode mode) {
+    if (!world) return;
+    if (mode < PHYSICS_SDF_BOX_SIGNED_DISTANCE || mode > PHYSICS_SDF_BOX_SURFACE_TRACE) return;
+    
+    world->settings.sdf_box_collision_mode = mode;
+}
+
+void SetSDFSurfaceTraceSettings(PhysicsWorld* world, PhysicsSDFBoxTraceSamples samples, int trace_steps, 
+                                int refine_steps, float surface_epsilon, int max_contacts) {
+    if (!world) return;
+    
+    if (samples >= PHYSICS_SDF_BOX_TRACE_CORNERS && samples <= PHYSICS_SDF_BOX_TRACE_FULL) {
+        world->settings.sdf_box_trace_samples = samples;
+    }
+    
+    world->settings.sdf_box_trace_steps = ClampPhysicsInt(trace_steps, 1, 128);
+    world->settings.sdf_box_trace_refine_steps = ClampPhysicsInt(refine_steps, 0, 32);
+    world->settings.sdf_box_surface_epsilon = fmaxf(surface_epsilon, 0.0f);
+    world->settings.sdf_box_max_contacts = ClampPhysicsInt(max_contacts, 1, 26);
+}
+
 // ================================
 // Contact Manifold System
 // ================================
@@ -2556,9 +3620,11 @@ void GenerateBoxBoxManifold(PhysicsWorld* world, int boxIndexA, int boxIndexB, C
     // Initialize manifold
     manifold->point_count = 0;
     manifold->bodyA_type = 1; // box
-    manifold->bodyA_index = boxIndexA;
+    manifold->bodyA_index = world->boxes->body_indices[boxIndexA];
+    manifold->colliderA_index = boxIndexA;
     manifold->bodyB_type = 1; // box
-    manifold->bodyB_index = boxIndexB;
+    manifold->bodyB_index = world->boxes->body_indices[boxIndexB];
+    manifold->colliderB_index = boxIndexB;
     
     Vec3 posA = world->boxes->positions[boxIndexA];
     Vec3 sizeA = world->boxes->sizes[boxIndexA];
@@ -2853,8 +3919,10 @@ void AddManifoldToConstraints(PhysicsWorld* world, ContactManifold* manifold) {
         
         constraint->bodyA_type = manifold->bodyA_type;
         constraint->bodyA_index = manifold->bodyA_index;
+        constraint->colliderA_index = manifold->colliderA_index;
         constraint->bodyB_type = manifold->bodyB_type;
         constraint->bodyB_index = manifold->bodyB_index;
+        constraint->colliderB_index = manifold->colliderB_index;
         
         constraint->contact_point = manifold->points[i];
         constraint->contact_normal = manifold->normal;  // Consistent normal for all points
