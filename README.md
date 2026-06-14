@@ -309,6 +309,12 @@ If using `ballbox.h` in this repo's test app, make sure `build/premake5.lua` doe
 ![demogif](./physicswip_constraints_velcontrol.gif)
 The previous gif is testing how the simulation handles direct velocity control and if I can constraint objects to remain together with just forces.
 
+
+
+https://github.com/user-attachments/assets/9436d8be-815e-4f14-b1e1-d88880b3c0cc
+
+
+
 # To do
 
 More demos and more gifs of new features.
