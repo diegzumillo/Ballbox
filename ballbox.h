@@ -179,7 +179,7 @@ typedef struct {
 typedef enum {
     PHYSICS_JOINT_FIXED = 0,
     PHYSICS_JOINT_HINGE = 1,
-    PHYSICS_JOINT_SPRING = 2
+    PHYSICS_JOINT_PISTON = 2
 } PhysicsJointType;
 
 typedef struct {
@@ -202,12 +202,18 @@ typedef struct {
     float motor_speed;
     float max_motor_impulse;
 
-    // Spring joints use Hooke force plus damping along the anchor-to-anchor
-    // line. rest_length is in world units, stiffness is force/unit, damping is
-    // force per relative velocity along the spring axis.
-    float rest_length;
+    // Piston spring settings. stiffness pulls toward target_travel along the
+    // piston axis; damping resists relative velocity along that axis.
     float stiffness;
     float damping;
+
+    // Piston joints constrain motion to local_axis_a/local_axis_b, with
+    // optional travel limits and a soft target along that axis.
+    float min_travel;
+    float max_travel;
+    float target_travel;
+    float limit_restitution;
+    bool enable_spring;
 } PhysicsJoint;
 
 typedef struct {
@@ -413,15 +419,17 @@ void ClearConstraints(ConstraintCollection* constraints);
 // the same iterative phase as contact constraints. Fixed joints constrain both
 // anchors and relative orientation. Hinge joints constrain the anchors and keep
 // the hinge axes aligned, leaving rotation around the hinge axis free.
-// Spring joints are soft force joints applied before velocity integration.
+// Piston joints constrain lateral anchor drift and relative orientation while
+// allowing bounded travel along one axis, with optional spring and limit bounce.
 JointSystem* CreateJointSystem(int capacity);
 void DestroyJointSystem(JointSystem* system);
 int AddFixedJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor);
 int AddHingeJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor, Vec3 worldAxis);
-int AddSpringJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchorA, Vec3 worldAnchorB,
-                   float rest_length, float stiffness, float damping);
+int AddPistonJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchorA, Vec3 worldAnchorB,
+                   Vec3 worldAxis, float min_travel, float max_travel);
 void SetHingeMotor(PhysicsWorld* world, int jointIndex, bool enabled, float motor_speed, float max_motor_impulse);
-void ApplySpringJointForces(PhysicsWorld* world);
+void SetPistonSpring(PhysicsWorld* world, int jointIndex, bool enabled, float target_travel, float stiffness, float damping);
+void SetPistonLimitBounce(PhysicsWorld* world, int jointIndex, float restitution);
 void SolveJointVelocityConstraints(PhysicsWorld* world);
 void SolveJointPositionConstraints(PhysicsWorld* world);
 
@@ -1763,26 +1771,31 @@ int AddHingeJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchor, V
     return index;
 }
 
-int AddSpringJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchorA, Vec3 worldAnchorB,
-                   float rest_length, float stiffness, float damping) {
+int AddPistonJoint(PhysicsWorld* world, int bodyA, int bodyB, Vec3 worldAnchorA, Vec3 worldAnchorB,
+                   Vec3 worldAxis, float min_travel, float max_travel) {
     if (!world || !world->joints || world->joints->count >= world->joints->capacity) return -1;
     if (!IsValidBodyIndex(world, bodyA) || !IsValidBodyIndex(world, bodyB) || bodyA == bodyB) return -1;
+
+    Vec3 axis = Vec3Normalize(worldAxis);
+    if (Vec3Length(axis) < world->settings.vector_normalize_epsilon) return -1;
 
     int index = world->joints->count++;
     PhysicsJoint* joint = &world->joints->joints[index];
     memset(joint, 0, sizeof(PhysicsJoint));
 
-    joint->type = PHYSICS_JOINT_SPRING;
+    joint->type = PHYSICS_JOINT_PISTON;
     joint->bodyA_index = bodyA;
     joint->bodyB_index = bodyB;
     joint->local_anchor_a = BodyLocalPoint(world, bodyA, worldAnchorA);
     joint->local_anchor_b = BodyLocalPoint(world, bodyB, worldAnchorB);
-    joint->local_axis_a = (Vec3){ 1.0f, 0.0f, 0.0f };
-    joint->local_axis_b = (Vec3){ 1.0f, 0.0f, 0.0f };
-    joint->reference_rotation = QuatIdentity();
-    joint->rest_length = fmaxf(rest_length, 0.0f);
-    joint->stiffness = fmaxf(stiffness, 0.0f);
-    joint->damping = fmaxf(damping, 0.0f);
+    joint->local_axis_a = BodyLocalVector(world, bodyA, axis);
+    joint->local_axis_b = BodyLocalVector(world, bodyB, axis);
+    joint->reference_rotation = QuatMultiply(QuatConjugate(world->bodies->rotations[bodyA]), world->bodies->rotations[bodyB]);
+    joint->min_travel = fminf(min_travel, max_travel);
+    joint->max_travel = fmaxf(min_travel, max_travel);
+    joint->target_travel = fmaxf(joint->min_travel, fminf(joint->max_travel, Vec3Dot(Vec3Sub(worldAnchorB, worldAnchorA), axis)));
+    joint->limit_restitution = 0.0f;
+    joint->enable_spring = false;
 
     return index;
 }
@@ -1798,44 +1811,25 @@ void SetHingeMotor(PhysicsWorld* world, int jointIndex, bool enabled, float moto
     joint->max_motor_impulse = fmaxf(max_motor_impulse, 0.0f);
 }
 
-void ApplySpringJointForces(PhysicsWorld* world) {
-    if (!world || !world->joints || !world->bodies) return;
+void SetPistonSpring(PhysicsWorld* world, int jointIndex, bool enabled, float target_travel, float stiffness, float damping) {
+    if (!world || !world->joints || jointIndex < 0 || jointIndex >= world->joints->count) return;
 
-    for (int i = 0; i < world->joints->count; i++) {
-        PhysicsJoint* joint = &world->joints->joints[i];
-        if (joint->type != PHYSICS_JOINT_SPRING) continue;
-        if (!IsValidBodyIndex(world, joint->bodyA_index) || !IsValidBodyIndex(world, joint->bodyB_index)) continue;
+    PhysicsJoint* joint = &world->joints->joints[jointIndex];
+    if (joint->type != PHYSICS_JOINT_PISTON) return;
 
-        int bodyA = joint->bodyA_index;
-        int bodyB = joint->bodyB_index;
-        Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
-        Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
-        Vec3 delta = Vec3Sub(anchorB, anchorA);
-        float length = Vec3Length(delta);
-        if (length < world->settings.vector_normalize_epsilon) continue;
+    joint->enable_spring = enabled;
+    joint->target_travel = fmaxf(joint->min_travel, fminf(joint->max_travel, target_travel));
+    joint->stiffness = fmaxf(stiffness, 0.0f);
+    joint->damping = fmaxf(damping, 0.0f);
+}
 
-        Vec3 axis = Vec3Scale(delta, 1.0f / length);
-        Vec3 velocityA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
-        Vec3 velocityB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
-        float relativeSpeed = Vec3Dot(Vec3Sub(velocityB, velocityA), axis);
+void SetPistonLimitBounce(PhysicsWorld* world, int jointIndex, float restitution) {
+    if (!world || !world->joints || jointIndex < 0 || jointIndex >= world->joints->count) return;
 
-        float displacement = length - joint->rest_length;
-        float forceMagnitude = joint->stiffness * displacement + joint->damping * relativeSpeed;
-        Vec3 force = Vec3Scale(axis, forceMagnitude);
+    PhysicsJoint* joint = &world->joints->joints[jointIndex];
+    if (joint->type != PHYSICS_JOINT_PISTON) return;
 
-        Vec3 rA = Vec3Sub(anchorA, world->bodies->positions[bodyA]);
-        Vec3 rB = Vec3Sub(anchorB, world->bodies->positions[bodyB]);
-
-        if (!world->bodies->is_static[bodyA]) {
-            AddBodyForce(world, bodyA, force);
-            AddBodyTorque(world, bodyA, Vec3Cross(rA, force));
-        }
-        if (!world->bodies->is_static[bodyB]) {
-            Vec3 opposite = Vec3Scale(force, -1.0f);
-            AddBodyForce(world, bodyB, opposite);
-            AddBodyTorque(world, bodyB, Vec3Cross(rB, opposite));
-        }
-    }
+    joint->limit_restitution = fmaxf(0.0f, fminf(restitution, 1.0f));
 }
 
 // ============================================================================
@@ -2069,33 +2063,106 @@ static float CalculateJointAngularMass(PhysicsWorld* world, int bodyA, int bodyB
     return (k > 1e-8f) ? 1.0f / k : 0.0f;
 }
 
+static Vec3 GetPistonAxis(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    Vec3 axisA = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyA], joint->local_axis_a));
+    Vec3 axisB = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyB], joint->local_axis_b));
+    Vec3 axis = Vec3Normalize(Vec3Add(axisA, axisB));
+    if (Vec3Length(axis) < world->settings.vector_normalize_epsilon) {
+        axis = axisA;
+    }
+    if (Vec3Length(axis) < world->settings.vector_normalize_epsilon) {
+        axis = (Vec3){ 1.0f, 0.0f, 0.0f };
+    }
+    return axis;
+}
+
+static void BuildPerpendicularBasis(Vec3 axis, Vec3* tangentA, Vec3* tangentB) {
+    Vec3 reference = fabsf(axis.y) < 0.9f ? (Vec3){ 0.0f, 1.0f, 0.0f } : (Vec3){ 1.0f, 0.0f, 0.0f };
+    *tangentA = Vec3Normalize(Vec3Cross(reference, axis));
+    *tangentB = Vec3Normalize(Vec3Cross(axis, *tangentA));
+}
+
+static void SolveJointLinearVelocityAxis(PhysicsWorld* world, int bodyA, int bodyB,
+                                         Vec3 anchorA, Vec3 anchorB, Vec3 axis,
+                                         float positionError, float velocityBias) {
+    Vec3 rA = Vec3Sub(anchorA, world->bodies->positions[bodyA]);
+    Vec3 rB = Vec3Sub(anchorB, world->bodies->positions[bodyB]);
+    Vec3 vA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
+    Vec3 vB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
+    float relVel = Vec3Dot(Vec3Sub(vB, vA), axis);
+    float bias = (world->settings.baumgarte_bias / world->dt) * positionError + velocityBias;
+    float mass = CalculateJointLinearMass(world, bodyA, bodyB, rA, rB, axis);
+    float impulseMagnitude = -(relVel + bias) * mass;
+    Vec3 impulse = Vec3Scale(axis, impulseMagnitude);
+
+    ApplyConstraintImpulse(world, 0, bodyA, Vec3Scale(impulse, -1.0f), Vec3Cross(rA, Vec3Scale(impulse, -1.0f)));
+    ApplyConstraintImpulse(world, 0, bodyB, impulse, Vec3Cross(rB, impulse));
+}
+
 static void SolveJointAnchorVelocity(PhysicsWorld* world, PhysicsJoint* joint) {
     int bodyA = joint->bodyA_index;
     int bodyB = joint->bodyB_index;
     Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
     Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
-    Vec3 rA = Vec3Sub(anchorA, world->bodies->positions[bodyA]);
-    Vec3 rB = Vec3Sub(anchorB, world->bodies->positions[bodyB]);
     Vec3 error = Vec3Sub(anchorB, anchorA);
     Vec3 axes[3] = {
         { 1.0f, 0.0f, 0.0f },
         { 0.0f, 1.0f, 0.0f },
         { 0.0f, 0.0f, 1.0f }
     };
-    float biasFactor = world->settings.baumgarte_bias / world->dt;
 
     for (int i = 0; i < 3; i++) {
         Vec3 axis = axes[i];
-        Vec3 vA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
-        Vec3 vB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
-        float relVel = Vec3Dot(Vec3Sub(vB, vA), axis);
-        float bias = biasFactor * Vec3Dot(error, axis);
-        float mass = CalculateJointLinearMass(world, bodyA, bodyB, rA, rB, axis);
-        float impulseMagnitude = -(relVel + bias) * mass;
-        Vec3 impulse = Vec3Scale(axis, impulseMagnitude);
+        SolveJointLinearVelocityAxis(world, bodyA, bodyB, anchorA, anchorB, axis, Vec3Dot(error, axis), 0.0f);
+    }
+}
+
+static void SolvePistonVelocity(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
+    Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
+    Vec3 delta = Vec3Sub(anchorB, anchorA);
+    Vec3 axis = GetPistonAxis(world, joint);
+    Vec3 tangentA;
+    Vec3 tangentB;
+    BuildPerpendicularBasis(axis, &tangentA, &tangentB);
+
+    SolveJointLinearVelocityAxis(world, bodyA, bodyB, anchorA, anchorB, tangentA, Vec3Dot(delta, tangentA), 0.0f);
+    SolveJointLinearVelocityAxis(world, bodyA, bodyB, anchorA, anchorB, tangentB, Vec3Dot(delta, tangentB), 0.0f);
+
+    Vec3 vA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
+    Vec3 vB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
+    float relVel = Vec3Dot(Vec3Sub(vB, vA), axis);
+    float travel = Vec3Dot(delta, axis);
+
+    if (joint->enable_spring && (joint->stiffness > 0.0f || joint->damping > 0.0f)) {
+        Vec3 rA = Vec3Sub(anchorA, world->bodies->positions[bodyA]);
+        Vec3 rB = Vec3Sub(anchorB, world->bodies->positions[bodyB]);
+        float iterationScale = world->settings.solver_iterations > 0 ? 1.0f / (float)world->settings.solver_iterations : 1.0f;
+        float displacement = travel - joint->target_travel;
+        float springForce = -(joint->stiffness * displacement + joint->damping * relVel);
+        Vec3 impulse = Vec3Scale(axis, springForce * world->dt * iterationScale);
 
         ApplyConstraintImpulse(world, 0, bodyA, Vec3Scale(impulse, -1.0f), Vec3Cross(rA, Vec3Scale(impulse, -1.0f)));
         ApplyConstraintImpulse(world, 0, bodyB, impulse, Vec3Cross(rB, impulse));
+    }
+
+    vA = GetConstraintBodyVelocityAtPoint(world, 0, bodyA, anchorA);
+    vB = GetConstraintBodyVelocityAtPoint(world, 0, bodyB, anchorB);
+    relVel = Vec3Dot(Vec3Sub(vB, vA), axis);
+    travel = Vec3Dot(Vec3Sub(anchorB, anchorA), axis);
+
+    if (travel < joint->min_travel) {
+        float velocityBias = (relVel < -world->settings.velocity_threshold) ? joint->limit_restitution * relVel : 0.0f;
+        SolveJointLinearVelocityAxis(world, bodyA, bodyB, anchorA, anchorB, axis, travel - joint->min_travel, velocityBias);
+    } else if (travel > joint->max_travel) {
+        float limitRelVel = -relVel;
+        float velocityBias = (limitRelVel < -world->settings.velocity_threshold) ? joint->limit_restitution * limitRelVel : 0.0f;
+        SolveJointLinearVelocityAxis(world, bodyA, bodyB, anchorA, anchorB, Vec3Scale(axis, -1.0f),
+                                     joint->max_travel - travel, velocityBias);
     }
 }
 
@@ -2148,7 +2215,7 @@ static void SolveJointAngularVelocity(PhysicsWorld* world, PhysicsJoint* joint) 
     Vec3 relW = Vec3Sub(wB, wA);
     float biasFactor = world->settings.baumgarte_bias / world->dt;
 
-    if (joint->type == PHYSICS_JOINT_FIXED) {
+    if (joint->type == PHYSICS_JOINT_FIXED || joint->type == PHYSICS_JOINT_PISTON) {
         Vec3 angularError = GetFixedJointAngularError(world, joint);
         Vec3 correctionVelocity = Vec3Add(relW, Vec3Scale(angularError, biasFactor));
         SolveJointAngularVelocityVector(world, bodyA, bodyB, correctionVelocity);
@@ -2185,8 +2252,13 @@ void SolveJointVelocityConstraints(PhysicsWorld* world) {
         PhysicsJoint* joint = &world->joints->joints[i];
         if (!IsValidBodyIndex(world, joint->bodyA_index) || !IsValidBodyIndex(world, joint->bodyB_index)) continue;
 
-        SolveJointAnchorVelocity(world, joint);
-        SolveJointAngularVelocity(world, joint);
+        if (joint->type == PHYSICS_JOINT_FIXED || joint->type == PHYSICS_JOINT_HINGE) {
+            SolveJointAnchorVelocity(world, joint);
+            SolveJointAngularVelocity(world, joint);
+        } else if (joint->type == PHYSICS_JOINT_PISTON) {
+            SolvePistonVelocity(world, joint);
+            SolveJointAngularVelocity(world, joint);
+        }
     }
 }
 
@@ -2222,6 +2294,38 @@ static void SolveJointAnchorPosition(PhysicsWorld* world, PhysicsJoint* joint) {
     }
 }
 
+static void SolvePistonPosition(PhysicsWorld* world, PhysicsJoint* joint) {
+    int bodyA = joint->bodyA_index;
+    int bodyB = joint->bodyB_index;
+    Vec3 anchorA = BodyWorldPoint(world, bodyA, joint->local_anchor_a);
+    Vec3 anchorB = BodyWorldPoint(world, bodyB, joint->local_anchor_b);
+    Vec3 delta = Vec3Sub(anchorB, anchorA);
+    Vec3 axis = GetPistonAxis(world, joint);
+    float travel = Vec3Dot(delta, axis);
+    Vec3 lateralError = Vec3Sub(delta, Vec3Scale(axis, travel));
+    Vec3 limitError = { 0.0f, 0.0f, 0.0f };
+
+    if (travel < joint->min_travel) {
+        limitError = Vec3Scale(axis, travel - joint->min_travel);
+    } else if (travel > joint->max_travel) {
+        limitError = Vec3Scale(axis, travel - joint->max_travel);
+    }
+
+    Vec3 error = Vec3Add(lateralError, limitError);
+    float invMassA = GetConstraintBodyInverseMass(world, 0, bodyA);
+    float invMassB = GetConstraintBodyInverseMass(world, 0, bodyB);
+    float totalInvMass = invMassA + invMassB;
+    if (totalInvMass <= 1e-8f) return;
+
+    Vec3 correction = Vec3Scale(error, 0.6f / totalInvMass);
+    if (invMassA > 0.0f) {
+        world->bodies->positions[bodyA] = Vec3Add(world->bodies->positions[bodyA], Vec3Scale(correction, invMassA));
+    }
+    if (invMassB > 0.0f) {
+        world->bodies->positions[bodyB] = Vec3Sub(world->bodies->positions[bodyB], Vec3Scale(correction, invMassB));
+    }
+}
+
 static void SolveJointAngularPosition(PhysicsWorld* world, PhysicsJoint* joint) {
     int bodyA = joint->bodyA_index;
     int bodyB = joint->bodyB_index;
@@ -2231,7 +2335,7 @@ static void SolveJointAngularPosition(PhysicsWorld* world, PhysicsJoint* joint) 
     if (totalInvMass <= 1e-8f) return;
 
     Vec3 error = { 0.0f, 0.0f, 0.0f };
-    if (joint->type == PHYSICS_JOINT_FIXED) {
+    if (joint->type == PHYSICS_JOINT_FIXED || joint->type == PHYSICS_JOINT_PISTON) {
         error = GetFixedJointAngularError(world, joint);
     } else if (joint->type == PHYSICS_JOINT_HINGE) {
         Vec3 axisA = Vec3Normalize(QuatRotateVec3(world->bodies->rotations[bodyA], joint->local_axis_a));
@@ -2251,8 +2355,13 @@ void SolveJointPositionConstraints(PhysicsWorld* world) {
         PhysicsJoint* joint = &world->joints->joints[i];
         if (!IsValidBodyIndex(world, joint->bodyA_index) || !IsValidBodyIndex(world, joint->bodyB_index)) continue;
 
-        SolveJointAnchorPosition(world, joint);
-        SolveJointAngularPosition(world, joint);
+        if (joint->type == PHYSICS_JOINT_FIXED || joint->type == PHYSICS_JOINT_HINGE) {
+            SolveJointAnchorPosition(world, joint);
+            SolveJointAngularPosition(world, joint);
+        } else if (joint->type == PHYSICS_JOINT_PISTON) {
+            SolvePistonPosition(world, joint);
+            SolveJointAngularPosition(world, joint);
+        }
     }
 
     SyncCollidersFromBodies(world);
@@ -2604,9 +2713,6 @@ void PhysicsStep(PhysicsWorld* world, float deltaTime) {
     // 1. Apply Forces
     ApplyForces(world);
 
-    // 1b. Apply soft spring joint forces
-    ApplySpringJointForces(world);
-    
     // 2. Integrate Velocities ONLY (not positions yet!)
     IntegrateVelocities(world);
     
